@@ -304,7 +304,7 @@ withdraw_fees:
     SOL:  { flat: "0.01",   percent: "0.001", min: "0.01" }
 
 matcher:
-  url: "http://localhost:8098"
+  url: "localhost:50051"
 
 scheduler:
   url: "http://localhost:8097"

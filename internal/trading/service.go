@@ -888,49 +888,76 @@ func (s *Service) settleTrade(ctx context.Context, tr *matching.Trade, takerUser
 	return nil
 }
 
-// persistOrder writes the order to the DB.
+// persistOrder writes the order to the DB. Returns a non-nil
+// error when no row was inserted (e.g. duplicate id, constraint
+// violation); updateOrderStatus below mirrors the same pattern.
 func (s *Service) persistOrder(ctx context.Context, o *matching.Order) error {
 	// Get pair_id from DB
 	var pairID int
 	err := s.pool.QueryRow(ctx, `SELECT id FROM trading_pairs WHERE base = $1 AND quote = $2`,
 		o.Base, o.Quote).Scan(&pairID)
 	if err != nil {
-		return err
+		return fmt.Errorf("lookup pair_id for %s_%s: %w", o.Base, o.Quote, err)
 	}
 
 	const q = `
 		INSERT INTO orders (id, user_id, pair_id, side, type, price, quantity, filled_quantity, status, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 	`
-	_, err = s.pool.Exec(ctx, q,
+	tag, err := s.pool.Exec(ctx, q,
 		o.ID, o.UserID, pairID, string(o.Side), string(o.Type),
 		o.Price, o.Quantity, o.FilledQty, string(o.Status))
-	return err
+	if err != nil {
+		return fmt.Errorf("insert order %s: %w", o.ID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("insert order %s: row not inserted", o.ID)
+	}
+	return nil
 }
 
 // updateOrderStatus updates the order's status + filled_quantity.
+// Returns a non-nil error when no row matched. That signals the
+// order is missing from the DB even though the matching engine
+// reported a trade against it. Without this check the API would
+// silently leave the DB in an inconsistent state (engine says
+// FILLED, DB says OPEN) after an external DELETE during
+// development. Callers should log the error prominently.
 func (s *Service) updateOrderStatus(ctx context.Context, id uuid.UUID, status matching.Status, filled decimal.Decimal) error {
 	const q = `UPDATE orders SET status = $2, filled_quantity = $3, updated_at = NOW() WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q, id, string(status), filled)
-	return err
+	tag, err := s.pool.Exec(ctx, q, id, string(status), filled)
+	if err != nil {
+		return fmt.Errorf("update order %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("update order %s: row not found (status=%s filled=%s)", id, status, filled)
+	}
+	return nil
 }
 
-// persistTrade writes the trade to the DB.
+// persistTrade writes the trade to the DB. Uses ON CONFLICT DO
+// NOTHING so a duplicate trade id (which should never happen, but
+// might if the stream forwarder re-delivers one) does not crash
+// the request with a constraint violation.
 func (s *Service) persistTrade(ctx context.Context, tr *matching.Trade) error {
 	// Get pair_id from DB
 	var pairID int
 	err := s.pool.QueryRow(ctx, `SELECT id FROM trading_pairs WHERE base = $1 AND quote = $2`,
 		tr.Base, tr.Quote).Scan(&pairID)
 	if err != nil {
-		return err
+		return fmt.Errorf("lookup pair_id for %s_%s: %w", tr.Base, tr.Quote, err)
 	}
 
 	const q = `
 		INSERT INTO trades (id, buy_order_id, sell_order_id, pair_id, price, quantity, taker_side, executed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (id) DO NOTHING
 	`
 	_, err = s.pool.Exec(ctx, q, tr.ID, tr.BuyOrderID, tr.SellOrderID, pairID, tr.Price, tr.Quantity, string(tr.TakerSide), tr.ExecutedAt)
-	return err
+	if err != nil {
+		return fmt.Errorf("insert trade %s: %w", tr.ID, err)
+	}
+	return nil
 }
 
 // AmendOrder amends an existing order's price and/or quantity.
