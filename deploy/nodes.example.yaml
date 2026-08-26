@@ -1,0 +1,27 @@
+# Node connection configuration for chainwatcher
+# Place at /etc/goexchange/nodes.yaml
+
+nodes:
+  - name: btc-mainnet
+    type: bitcoin
+    url: "https://btc-node-1.internal:8443"
+    cert_file: "/etc/goexchange/certs/btc.crt"
+    key_file: "/etc/goexchange/certs/btc.key"
+    ca_cert_file: "/etc/goexchange/certs/ca.crt"
+    api_secret: "${BTC_API_SECRET}"
+    timeout: 30s
+    max_retries: 2
+    failover: "https://btc-node-2.internal:8443"
+    health_check: "getblockchaininfo"
+
+  - name: eth-mainnet
+    type: ethereum
+    url: "https://eth-node-1.internal:8443"
+    cert_file: "/etc/goexchange/certs/eth.crt"
+    key_file: "/etc/goexchange/certs/eth.key"
+    ca_cert_file: "/etc/goexchange/certs/ca.crt"
+    api_secret: "${ETH_API_SECRET}"
+    timeout: 30s
+    max_retries: 2
+    failover: "https://eth-node-2.internal:8443"
+    health_check: "eth_blockNumber"

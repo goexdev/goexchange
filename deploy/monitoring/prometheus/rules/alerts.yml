@@ -1,0 +1,86 @@
+groups:
+- name: goexchange-alerts
+  rules:
+  # High HTTP error rate
+  - alert: HighErrorRate
+    expr: |
+      sum(rate(goexchange_http_requests_total{status=~"5.."}[5m])) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate detected"
+      description: "5xx errors > 0.1/s for 5 minutes"
+
+  # API slow
+  - alert: SlowAPI
+    expr: |
+      histogram_quantile(0.95, sum by (path) (rate(goexchange_http_request_duration_seconds_bucket[5m]))) > 2
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "API slow response ({{ $labels.path }})"
+      description: "p95 > 2s for 10 minutes"
+
+  # Chain down
+  - alert: ChainDown
+    expr: |
+      goexchange_chain_watcher_status == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Chain {{ $labels.chain }} down"
+      description: "Watcher reported unhealthy"
+
+  # Chain sync lag
+  - alert: ChainSyncLag
+    expr: |
+      deriv(goexchange_chain_block_height[5m]) == 0
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Chain {{ $labels.chain }} not progressing"
+
+  # DB pool exhausted
+  - alert: DBPoolExhausted
+    expr: |
+      goexchange_db_connections_active > 7
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "DB connection pool near max"
+
+  # No trading pairs enabled
+  - alert: NoMarketsEnabled
+    expr: |
+      goexchange_market_pairs_enabled == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "No trading pairs enabled"
+      description: "All pairs are disabled - users cannot trade"
+
+  # Ticker poller stopped
+  - alert: TickerPollerStalled
+    expr: |
+      rate(goexchange_ticker_updates_total[5m]) == 0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Ticker poller not updating"
+
+  # WebSocket disconnect spike
+  - alert: WSConnectionsDrop
+    expr: |
+      sum(goexchange_ws_connections_active) < 1
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "No active WS connections"

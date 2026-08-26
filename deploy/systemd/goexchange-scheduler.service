@@ -1,0 +1,63 @@
+[Unit]
+Description=goexchange Scheduler (chainwatcher poll loop + DB migrations on startup)
+Documentation=https://github.com/goexdev/goexchange
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+# Run scheduler briefly on boot to apply any pending DB migrations
+# before api/matcher start (so they don't see stale schema)
+Before=goexchange-api.service goexchange-matcher.service
+
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/goexchange
+ExecStart=/root/goexchange/bin/scheduler
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Environment
+Environment=GIN_MODE=release
+Environment=GOEXCHANGE_CONFIG=/root/goexchange/config.yaml
+EnvironmentFile=-/root/goexchange/.env
+
+# Health check (scheduler has no HTTP endpoint, check it's alive by PID)
+ExecStartPost=/bin/sh -c 'sleep 2; kill -0 $MAINPID && exit 0 || exit 1'
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=goexchange-scheduler
+
+# Hardening
+NoNewPrivileges=true
+# /root/goexchange needs writes for logs (can be moved to /tmp later)
+ProtectSystem=off
+# ProtectHome=false because we need /root/goexchange (could be /opt/goexchange instead)
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectProc=invisible
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+# WantedBy goexchange.target means all 3 binaries start together
+# To start individually: systemctl start goexchange-<name>
+# To start all: systemctl start goexchange.target
+WantedBy=goexchange.target

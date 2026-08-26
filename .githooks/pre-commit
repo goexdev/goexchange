@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook - runs fast tests before commit
+# Install: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running pre-commit QA checks..."
+
+# 1. TypeScript check (fast)
+cd /root/goexchange/web
+if ! npx tsc --noEmit > /tmp/precommit-tsc.log 2>&1; then
+    echo "TypeScript errors found. Run 'cd web && npx tsc --noEmit' to see details."
+    cat /tmp/precommit-tsc.log | tail -20
+    exit 1
+fi
+
+# 2. Vitest unit tests (fast - ~2s)
+if ! ./node_modules/.bin/vitest run > /tmp/precommit-vitest.log 2>&1; then
+    echo "Frontend tests failed."
+    tail -20 /tmp/precommit-vitest.log
+    exit 1
+fi
+
+# 3. Go build check (fast)
+cd /root/goexchange
+if ! /usr/local/go/bin/go build ./... > /tmp/precommit-go.log 2>&1; then
+    echo "Go build failed."
+    tail -20 /tmp/precommit-go.log
+    exit 1
+fi
+
+echo "Pre-commit checks passed"

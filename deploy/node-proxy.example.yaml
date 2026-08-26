@@ -1,0 +1,56 @@
+# node-proxy configuration (Read + Broadcast mode)
+# Place at /etc/goexchange/node-proxy.yaml
+
+listen_addr: "10.0.3.5:8443"  # node subnet (BTC example)
+
+# Server cert
+tls_cert: "/etc/goexchange/certs/node-proxy.crt"
+tls_key: "/etc/goexchange/certs/node-proxy.key"
+client_cas: "/etc/goexchange/certs/ca.crt"
+
+# Security - read access from exchange
+api_secrets:
+  - "${NODE_PROXY_SECRET}"
+allowed_cns:
+  - "goexchange-chainwatcher"
+allowed_ips:
+  - "10.0.1.0/24"  # business subnet (read)
+  - "10.0.2.0/24"  # signer subnet (broadcast)
+
+# Read methods - general queries
+# Empty = all GET-style methods allowed
+read_methods: []
+
+# Broadcast methods - ONLY these for sending pre-signed txs
+broadcast_methods:
+  - "sendrawtransaction"
+  - "sendTransaction"
+  - "eth_sendRawTransaction"
+  - "submit_transfer"
+  - "relay_tx"
+
+# Disabled methods - NEVER allowed (would expose private key control)
+disabled_methods:
+  - "sendtoaddress"
+  - "sendmany"
+  - "signrawtransactionwithkey"
+  - "walletpassphrase"
+  - "personal_sign"
+  - "eth_sendTransaction"
+  - "transfer"
+
+# Methods that REQUIRE signed requests
+require_signed_methods:
+  - "sendrawtransaction"
+  - "eth_sendRawTransaction"
+  - "submit_transfer"
+
+rate_limit: 100
+timeout: 30s
+require_signed: false  # false for read, true for broadcast
+audit_log: "/var/log/goexchange/node-proxy-audit.log"
+
+# Upstream daemon
+upstream_url: "http://127.0.0.1:8332"  # bitcoind
+# For ETH: http://127.0.0.1:8545
+# For future chains

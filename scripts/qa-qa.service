@@ -1,0 +1,14 @@
+[Unit]
+Description=goexchange QA Test Suite
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/goexchange
+ExecStart=/root/goexchange/scripts/qa.sh --auto --notify
+StandardOutput=append:/var/log/qa-cron.log
+StandardError=append:/var/log/qa-cron.log
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=goexchange (all 3 binaries: api + matcher + scheduler)
+Documentation=https://github.com/goexdev/goexchange
+
+[Install]
+WantedBy=multi-user.target

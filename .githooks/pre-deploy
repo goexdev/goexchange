@@ -1,0 +1,19 @@
+#!/bin/bash
+# Pre-deploy hook - runs full QA before deploying
+
+set -e
+
+echo "Running pre-deploy QA suite..."
+
+# Run full QA
+/root/goexchange/scripts/qa.sh --auto
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "QA FAILED - deploy aborted"
+    echo "Fix issues and re-run: ./scripts/qa.sh"
+    exit 1
+fi
+
+echo ""
+echo "QA PASSED - safe to deploy"

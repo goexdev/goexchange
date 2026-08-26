@@ -1,0 +1,217 @@
+syntax = "proto3";
+
+package matching.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/goexdev/goexchange/internal/matching/matchingv1";
+
+// MatchingService is the gRPC interface between the public API server
+// and the proprietary matching engine. The public repository owns the
+// .proto file (this file); the matching engine generates stubs from
+// it during build.
+service MatchingService {
+  // PlaceOrder submits a new order to the matching engine and
+  // returns any trades it produced plus the order's new status.
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse);
+
+  // CancelOrder cancels an existing open order.
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // AmendOrder modifies an open order's price or quantity. The
+  // returned trades reflect any new matches triggered by the
+  // amendment.
+  rpc AmendOrder(AmendOrderRequest) returns (AmendOrderResponse);
+
+  // GetOrderBook returns a snapshot of one pair's book at the
+  // requested depth (each side).
+  rpc GetOrderBook(GetOrderBookRequest) returns (OrderBookSnapshot);
+
+  // GetTicker returns the 24h rolling summary for one pair.
+  rpc GetTicker(GetTickerRequest) returns (Ticker);
+
+  // GetOrder returns a single order's current state.
+  rpc GetOrder(GetOrderRequest) returns (Order);
+
+  // StreamTrades subscribes to a live feed of trade + order updates.
+  rpc StreamTrades(StreamTradesRequest) returns (stream TradeEvent);
+}
+
+// ---- Messages ----
+
+message PlaceOrderRequest {
+  string order_id = 1;
+  string user_id = 2;
+  string pair = 3;
+  Side side = 4;
+  OrderType type = 5;
+
+  // Decimal values are encoded as strings to preserve precision.
+  string price = 6;
+  string quantity = 7;
+
+  TimeInForce time_in_force = 8;
+  STPMode stp_mode = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  string stop_price = 11;
+  string client_id = 12;
+}
+
+message PlaceOrderResponse {
+  string order_id = 1;
+  Status status = 2;
+  string filled = 3;
+  string remaining = 4;
+  repeated Trade trades = 5;
+  string reject_reason = 6;
+}
+
+message CancelOrderRequest {
+  string order_id = 1;
+  string user_id = 2;
+}
+
+message CancelOrderResponse {
+  // Empty for now; surface cancel errors via gRPC status.
+}
+
+message AmendOrderRequest {
+  string order_id = 1;
+  string user_id = 2;
+  string new_price = 3;
+  string new_quantity = 4;
+}
+
+message AmendOrderResponse {
+  Order order = 1;
+  repeated Trade trades = 2;
+  string reject_reason = 3;
+}
+
+message GetOrderBookRequest {
+  string pair = 1;
+  int32 depth = 2;
+}
+
+message GetTickerRequest {
+  string pair = 1;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message StreamTradesRequest {
+  // Empty; future versions may filter by pair or user.
+}
+
+message Order {
+  string id = 1;
+  string user_id = 2;
+  string pair = 3;
+  string base = 4;
+  string quote = 5;
+  Side side = 6;
+  OrderType type = 7;
+  string price = 8;
+  string quantity = 9;
+  string filled = 10;
+  string remaining = 11;
+  Status status = 12;
+  TimeInForce time_in_force = 13;
+  STPMode stp_mode = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+  google.protobuf.Timestamp expires_at = 17;
+  string stop_price = 18;
+  string client_id = 19;
+}
+
+message Trade {
+  string id = 1;
+  string pair = 2;
+  string buy_order_id = 3;
+  string sell_order_id = 4;
+  string buy_user_id = 5;
+  string sell_user_id = 6;
+  string base = 7;
+  string quote = 8;
+  string base_amount = 9;
+  string quote_amount = 10;
+  string price = 11;
+  string quantity = 12;
+  Side taker_side = 13;
+  google.protobuf.Timestamp executed_at = 14;
+}
+
+message OrderBookSnapshot {
+  string pair = 1;
+  repeated PriceLevel bids = 2;
+  repeated PriceLevel asks = 3;
+}
+
+message PriceLevel {
+  string price = 1;
+  string quantity = 2;
+}
+
+message Ticker {
+  string pair = 1;
+  string last_price = 2;
+  string best_bid = 3;
+  string best_ask = 4;
+  string volume_24h = 5;
+  string high_24h = 6;
+  string low_24h = 7;
+  string change_24h = 8;
+  int64 trades_24h = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message TradeEvent {
+  enum Type {
+    TRADE = 0;
+    ORDER_UPDATE = 1;
+  }
+  Type type = 1;
+  Trade trade = 2;          // when type == TRADE
+  Order order = 3;           // when type == ORDER_UPDATE
+}
+
+// ---- Enums ----
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  BUY = 1;
+  SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  LIMIT = 1;
+  MARKET = 2;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OPEN = 1;
+  PARTIAL = 2;
+  FILLED = 3;
+  CANCELED = 4;
+  REJECTED = 5;
+}
+
+enum TimeInForce {
+  TIF_UNSPECIFIED = 0;
+  GTC = 1;
+  IOC = 2;
+  FOK = 3;
+}
+
+enum STPMode {
+  STP_UNSPECIFIED = 0;
+  NONE = 1;
+  CANCEL_TAKER = 2;
+  CANCEL_MAKER = 3;
+  CANCEL_BOTH = 4;
+}

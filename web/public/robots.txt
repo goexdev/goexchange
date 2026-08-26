@@ -1,0 +1,14 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /api/
+Disallow: /user
+Disallow: /wallet
+Disallow: /orders
+Disallow: /withdraw
+Disallow: /notifications
+Disallow: /kyc
+Disallow: /api-keys
+Disallow: /settings
+
+Sitemap: https://pow.credit/sitemap.xml

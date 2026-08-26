@@ -1,0 +1,153 @@
+{
+  "title": "goexchange",
+  "uid": "goexchange-main",
+  "schemaVersion": 30,
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "HTTP Request Rate (req/s)",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "expr": "sum(rate(goexchange_http_requests_total[1m]))",
+          "legendFormat": "all"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active WS Connections",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "expr": "sum(goexchange_ws_connections_active) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Enabled Trading Pairs",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "expr": "goexchange_market_pairs_enabled",
+          "legendFormat": "enabled"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Total Trading Pairs",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "targets": [
+        {
+          "expr": "goexchange_market_pairs_total",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP Request Duration (p95)",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(goexchange_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP Status Codes",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(goexchange_http_requests_total[1m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Chain Block Heights",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "goexchange_chain_block_height",
+          "legendFormat": "{{chain}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "DB Connections",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "goexchange_db_connections_active",
+          "legendFormat": "active"
+        },
+        {
+          "expr": "goexchange_db_connections_idle",
+          "legendFormat": "idle"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Orders Placed (per minute)",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (pair) (rate(goexchange_orders_placed_total[1m]))",
+          "legendFormat": "{{pair}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Trade Volume",
+      "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (pair) (rate(goexchange_trade_volume_total[5m]))",
+          "legendFormat": "{{pair}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Deposits / Withdrawals",
+      "gridPos": {"x": 0, "y": 28, "w": 24, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (chain, asset) (rate(goexchange_deposits_total[5m]))",
+          "legendFormat": "deposit {{chain}}/{{asset}}"
+        },
+        {
+          "expr": "sum by (chain, asset) (rate(goexchange_withdrawals_total[5m]))",
+          "legendFormat": "withdraw {{chain}}/{{asset}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "WS Events / second",
+      "gridPos": {"x": 0, "y": 36, "w": 24, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (endpoint, type) (rate(goexchange_ws_events_total[1m]))",
+          "legendFormat": "{{endpoint}}/{{type}}"
+        }
+      ]
+    }
+  ]
+}

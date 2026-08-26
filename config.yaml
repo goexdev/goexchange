@@ -1,0 +1,325 @@
+app:
+  port: 8099
+  matcher_port: 8098
+  scheduler_port: 8097
+  env: prod
+
+database:
+  url: postgres://exchange:exchange@localhost:5433/exchange?sslmode=disable
+
+redis:
+  addr: localhost:6388
+
+jwt:
+  # Loaded from Vault secret/auth/jwt in production (see vault.enabled below)
+  secret: "471dc55faa0279bdcb6c7e7e0d8c5e7e1e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+  ttl: 3600
+
+# Vault configuration (HashiCorp Vault for secret storage)
+# Set enabled: true to load all secrets from Vault at boot
+# When enabled: DB password, JWT secret, signing keys all come from Vault
+# When disabled: fall back to config.yaml values
+vault:
+  enabled: true
+  address: "http://127.0.0.1:8200"
+
+  # Auth method
+  # auth_method: "static"      # DEV only (NEVER in production)
+  auth_method: "static"    # PROD: role_id + secret_id (auto-rotating tokens)
+  app_role_id: ""
+  app_secret_id: "b5520d44-f269-cfa6-b6bc-f72ba81be5e3"
+  # k8s_role: "goexchange"   # K8s ServiceAccount auth (for K8s deploys)
+
+  token: "dev-root-token"
+
+  # Caching TTL (5 min)
+  cache_ttl_sec: 300
+
+  # Paths to secrets
+  db_path: "db/postgres"
+  jwt_path: "auth/jwt"
+
+chainwatcher:
+  driver: "evm"
+  poll_interval_sec: 10
+  min_conf: 6
+  mock_interval_sec: 0
+  mock_max_amount_usd: 100
+  hot_wallet_address: "FgLUhCfLyjxJVez49RGw8n5pDpu5qnip8U"
+
+  chains:
+    ltc:
+      enabled: false              # disabled - no LTC node
+      driver: "btc"
+      family: "bitcoin"           # use BTCDeriver
+      coin_type: 2                # LTC BIP-44 coin type
+      p2pkh_prefix: 0x30          # LTC mainnet P2PKH prefix
+      chain_kind: "bitcoin"
+      asset: "LTC"
+      rpc_url: "http://ltc-node:port"
+      min_conf: 6
+      poll_interval_sec: 60
+      hot_wallet: "LSFmGJugHwcwq6N6sWGJ1oJFZomSLWh9Va"
+      signer: "vault"
+      vault_secret_path: "secret/ltc/hot-wallet"
+      display_name: "Litecoin"
+      decimals: 8
+
+    btc:
+      enabled: false
+      driver: "btc"
+      rpc_url: ""
+      rpc_user: ""
+      rpc_pass: ""
+      asset: "BTC"
+      min_conf: 6
+      hot_wallet: ""
+      signer: "btc-core"
+
+    eth:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://ethereum-rpc.publicnode.com"
+      asset: "ETH"
+      family: "evm"
+      min_conf: 12
+      chain_id: 1                # Ethereum mainnet
+      # Hot wallet auto-derived from BIP-44 HD wallet
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/0"    # 1st EVM address
+      signer: "vault"
+      tokens:
+        - symbol: "USDT"
+          contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # ETH mainnet USDT (6 decimals!)
+          decimals: 6
+          min_conf: 12
+        - symbol: "USDC"
+          contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # ETH mainnet USDC (6 decimals!)
+          decimals: 6
+          min_conf: 12
+        - symbol: "DAI"
+          contract: "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # ETH mainnet DAI
+          decimals: 18
+          min_conf: 12
+
+    polygon:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://polygon-bor-rpc.publicnode.com"
+      asset: "MATIC"
+      family: "evm"
+      min_conf: 30            # Polygon has 2s blocks, need more for finality
+      chain_id: 137          # Polygon mainnet
+      # HD wallet derivation (production)
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/2"    # 3rd EVM address (Polygon)
+      signer: "vault"
+      tokens:
+        - symbol: "USDC"
+          contract: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Polygon native USDC
+          decimals: 6
+          min_conf: 30
+        - symbol: "USDT"
+          contract: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"  # Polygon USDT
+          decimals: 6
+          min_conf: 30
+        - symbol: "DAI"
+          contract: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"  # Polygon DAI
+          decimals: 18
+          min_conf: 30
+
+    arbitrum:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://arb1.arbitrum.io/rpc"
+      asset: "ETH"
+      family: "evm"
+      min_conf: 10            # Arbitrum has ~250ms blocks
+      chain_id: 42161        # Arbitrum One
+      # HD wallet derivation (production)
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/3"    # 4th EVM address (Arbitrum)
+      signer: "vault"
+      tokens:
+        - symbol: "USDC"
+          contract: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"  # Arbitrum native USDC
+          decimals: 6
+          min_conf: 10
+        - symbol: "USDT"
+          contract: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"  # Arbitrum USDT
+          decimals: 6
+          min_conf: 10
+        - symbol: "DAI"
+          contract: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000DA1"  # Arbitrum DAI
+          decimals: 18
+          min_conf: 10
+
+    optimism:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://mainnet.optimism.io"
+      asset: "ETH"
+      family: "evm"
+      min_conf: 10            # Optimism has 2s blocks
+      chain_id: 10            # Optimism mainnet
+      # HD wallet derivation (production)
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/4"    # 5th EVM address (Optimism)
+      signer: "vault"
+      tokens:
+        - symbol: "USDC"
+          contract: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"  # Optimism native USDC
+          decimals: 6
+          min_conf: 10
+        - symbol: "USDT"
+          contract: "0x94b008aA51179C9b73A1F4d8F73B95A4C8FD7B97"  # Optimism USDT
+          decimals: 6
+          min_conf: 10
+        - symbol: "DAI"
+          contract: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000DA1"  # Optimism DAI
+          decimals: 18
+          min_conf: 10
+
+    base:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://mainnet.base.org"
+      asset: "ETH"
+      family: "evm"
+      min_conf: 10            # Base has 2s blocks
+      chain_id: 8453          # Base mainnet (Coinbase L2)
+      # HD wallet derivation (production)
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/5"    # 6th EVM address (Base)
+      signer: "vault"
+      tokens:
+        - symbol: "USDC"
+          contract: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # Base native USDC
+          decimals: 6
+          min_conf: 10
+        - symbol: "DAI"
+          contract: "0x50c5725949A6F0c72E6C4a641F24049F91723e658"  # Base DAI
+          decimals: 18
+          min_conf: 10
+
+    bsc:
+      enabled: true
+      driver: "evm"
+      rpc_url: "https://bsc-testnet-rpc.publicnode.com"
+      asset: "BNB"
+      family: "evm"
+      min_conf: 15
+      chain_id: 97
+      # HD wallet derivation (production)
+      derivation:
+        mnemonic_secret: "secret/hd/mnemonic"
+        path: "m/44/60/0/0/1"      # bsc hot wallet
+      signer: "vault"
+      tokens:
+        - symbol: "USDT"
+          contract: "0x337610d27c682E347C9cDc60D17240a4dAE5bBdA"  # BSC testnet BEP-20 USDT
+          decimals: 18
+          min_conf: 15
+        - symbol: "USDC"
+          contract: "0x64544969ed7EB3032d3BeF8b4dbd6E7Dd2c6F6E5"  # BEP-20 USDC
+          decimals: 18
+          min_conf: 15
+        - symbol: "BUSD"
+          contract: "0xeD24FC36d5Ee211c25DE6bFC1B6db6FF1c6d63d8"  # BEP-20 BUSD
+          decimals: 18
+          min_conf: 15
+        - symbol: "DAI"
+          contract: "0x3dB4cB3A991c854D457f66a745949fD43dA55D6B"  # BEP-20 DAI
+          decimals: 18
+          min_conf: 15
+
+  # Markets: trading pairs derived from active currencies
+  # Each pair can be enabled/disabled at runtime via admin API
+  pairs:
+    - base: "BTC"
+      quote: "USDT"
+      enabled: true
+      display_name: "Bitcoin / Tether"
+      min_quantity: "0.0001"
+      min_price: "0.01"
+      price_tick: "0.01"
+      quantity_tick: "0.0001"
+      maker_fee_bps: 10
+      taker_fee_bps: 20
+    - base: "ETH"
+      quote: "USDT"
+      enabled: true
+      display_name: "Ethereum / Tether"
+      min_quantity: "0.001"
+      min_price: "0.01"
+      price_tick: "0.01"
+      quantity_tick: "0.001"
+      maker_fee_bps: 10
+      taker_fee_bps: 20
+    - base: "BNB"
+      quote: "USDT"
+      enabled: true
+      display_name: "BNB / Tether"
+      min_quantity: "0.001"
+      min_price: "0.01"
+      price_tick: "0.01"
+      quantity_tick: "0.001"
+      maker_fee_bps: 10
+      taker_fee_bps: 20
+    - base: "SOL"
+      quote: "USDT"
+      enabled: true
+      display_name: "Solana / Tether"
+      min_quantity: "0.01"
+      min_price: "0.01"
+      price_tick: "0.01"
+      quantity_tick: "0.01"
+      maker_fee_bps: 10
+      taker_fee_bps: 20
+    - base: "USDC"
+      quote: "USDT"
+      enabled: false  # disabled by default - admin can enable
+      display_name: "USDC / Tether (stable pair)"
+      min_quantity: "1"
+      min_price: "0.0001"
+      price_tick: "0.0001"
+      quantity_tick: "0.01"
+      maker_fee_bps: 5
+      taker_fee_bps: 10
+# Withdraw fees per currency (admin can override via UI)
+# Total fee = max(flat, amount * percent), then max(fee, min)
+# Stored in DB but seeded from these defaults on first run
+withdraw_fees:
+  defaults:
+    BTC:  { flat: "0.0005", percent: "0.001", min: "0.0001" }
+    ETH:  { flat: "0.005",  percent: "0.001", min: "0.001" }
+    BNB:  { flat: "0.005",  percent: "0.001", min: "0.01" }
+    USDT: { flat: "1.0",    percent: "0",     min: "1.0" }
+    USDC: { flat: "1.0",    percent: "0",     min: "1.0" }
+    SOL:  { flat: "0.01",   percent: "0.001", min: "0.01" }
+
+matcher:
+  url: "http://localhost:8098"
+
+scheduler:
+  url: "http://localhost:8097"
+
+
+notifier:
+  worker_interval_sec: 30
+  provider: "smtp"
+  smtp:
+    host: "127.0.0.1"
+    port: 1025
+    user: ""
+    password: ""
+    from: "noreply@goexchange.local"
+  resend:
+    api_key: ""
+    from: "noreply@goexchange.local"
+  from: "noreply@goexchange.local"
