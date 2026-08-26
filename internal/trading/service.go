@@ -822,12 +822,12 @@ func (s *Service) PlaceOrder(ctx context.Context, in PlaceOrderInput) (*PlaceOrd
 //
 // BUY taker (current order):
 //   - Already froze quote (USDT) for full qty on place
-//   - For each fill: unfreeze filled_qty * price (quote), credit base (BTC)
+//   - For each fill: debit_frozen filled_qty * price (quote), credit base (BTC)
 // SELL taker:
 //   - Already froze base (BTC) for full qty on place
-//   - For each fill: unfreeze filled_qty (base), credit quote (USDT)
+//   - For each fill: debit_frozen filled_qty (base), credit quote (USDT)
 //
-// Maker always had opposite asset frozen. Need to unfreeze + credit.
+// Maker always had opposite asset frozen. Need to debit_frozen + credit.
 func (s *Service) settleTrade(ctx context.Context, tr *matching.Trade, takerUserID uuid.UUID) error {
 	notional := tr.Quantity.Mul(tr.Price) // quote amount
 	baseAmt := tr.Quantity                // base amount
@@ -841,18 +841,25 @@ func (s *Service) settleTrade(ctx context.Context, tr *matching.Trade, takerUser
 
 	// Taker actions
 	if takerIsBuyer {
-		// Taker (buyer) already froze quote, unfreeze filled portion
-		if err := s.wallet.Unfreeze(ctx, takerUserID, tr.Quote, notional); err != nil {
-			return fmt.Errorf("taker unfreeze quote: %w", err)
+		// Taker (buyer) already froze quote; debit the filled portion
+		// directly from frozen (settle the trade) rather than unfreezing
+		// it back to available. Using Unfreeze here made the buy
+		// effectively free — the buyer received base without paying
+		// quote, which is a critical accounting bug. See settleTrade
+		// doc comment + commit fixing taker settlement paths.
+		if err := s.wallet.DebitFrozen(ctx, takerUserID, tr.Quote, notional); err != nil {
+			return fmt.Errorf("taker debit frozen quote: %w", err)
 		}
 		// Taker receives base
 		if err := s.wallet.Credit(ctx, takerUserID, tr.Base, baseAmt); err != nil {
 			return fmt.Errorf("taker credit base: %w", err)
 		}
 	} else {
-		// Taker (seller) already froze base, unfreeze filled portion
-		if err := s.wallet.Unfreeze(ctx, takerUserID, tr.Base, baseAmt); err != nil {
-			return fmt.Errorf("taker unfreeze base: %w", err)
+		// Taker (seller) already froze base; debit the filled portion
+		// directly from frozen (settle the trade) rather than unfreezing
+		// it back to available. See symmetric note above for BUY taker.
+		if err := s.wallet.DebitFrozen(ctx, takerUserID, tr.Base, baseAmt); err != nil {
+			return fmt.Errorf("taker debit frozen base: %w", err)
 		}
 		// Taker receives quote
 		if err := s.wallet.Credit(ctx, takerUserID, tr.Quote, notional); err != nil {
