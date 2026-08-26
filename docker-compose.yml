@@ -1,3 +1,25 @@
+# docker-compose.yml
+#
+# This file orchestrates the docker-side of the goexchange stack:
+#   - postgres   shared database
+#   - redis      rate limiting + notifications
+#   - vault      secret storage (local dev only; use hosted Vault in prod)
+#   - mailhog    local SMTP sink for dev
+#   - prometheus metrics scraper
+#   - grafana    dashboards
+#   - matching   the closed-source matching engine (private GHCR image)
+#
+# The API and scheduler run on the host (they are public-source Go
+# binaries and are easier to iterate on without rebuilding an
+# image). They connect to the matching engine over gRPC.
+#
+# Quick start:
+#   cp .env.example .env   # edit JWT_SECRET and VAULT_TOKEN
+#   docker compose up -d
+#   # on the host, with the public repo checked out:
+#   ./bin/api &
+#   ./bin/scheduler &
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -30,6 +52,97 @@ services:
       timeout: 3s
       retries: 5
 
+  # HashiCorp Vault in dev mode. DO NOT use this in production;
+  # point VAULT_ADDR at a real Vault cluster instead and disable
+  # this service.
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: goexchange-vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-please_change_me}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # SMTP sink for local dev. Drop outbound email here instead of
+  # hitting a real mail provider. The web UI at :8025 shows the
+  # captured messages.
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: goexchange-mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: goexchange-prometheus
+    volumes:
+      - ./deploy/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/prometheus/rules/alerts.yml:/etc/prometheus/rules/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    # scrape the host-published API and scheduler endpoints
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: goexchange-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./deploy/monitoring/grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+      - ./deploy/grafana/goexchange-dashboard.json:/var/lib/grafana/dashboards/goexchange.json:ro
+    ports:
+      - "3000:3000"
+
+  # The closed-source matching engine. Pulled from a private GHCR
+  # image; the source lives in the private goexdev-core repository.
+  #
+  # The matching binary speaks gRPC on :50051 and connects to
+  # Postgres at startup to load trading pairs and open orders. No
+  # license server, no outbound auth: the public-private repo split
+  # is what actually protects the source.
+  matching:
+    image: ghcr.io/goexdev/goexchange-core:latest
+    container_name: goexchange-matching
+    environment:
+      GRPC_ADDR: ":50051"
+      DATABASE_URL: postgres://exchange:exchange@postgres:5432/exchange?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/50051 && exec 3<&-"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
 volumes:
   goexchange_pgdata:
   goexchange_redisdata:
+
+# The host-side API and scheduler are not in this compose file.
+# Run them from the public repo on the host:
+#
+#   cd /root/goexdev-public
+#   set -a; source .env; set +a
+#   ./bin/api &
+#   ./bin/scheduler &
+#
+# Their gRPC client points at matching:50051 when launched from
+# inside the compose network, or at localhost:50051 when launched
+# from the host (the published port).
