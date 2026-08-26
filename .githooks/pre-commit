@@ -1,32 +1,91 @@
 #!/bin/bash
-# Pre-commit hook - runs fast tests before commit
-# Install: git config core.hooksPath .githooks
+# Pre-commit hook for the public goexdev-public repo.
+#
+# Targets:   /root/goexdev-public/  (this repo)
+# Companion: /root/goexdev-core/     (closed-source matching; plain build only)
+#
+# Install:   git config core.hooksPath .githooks
+#
+# Checks:
+#   1. Zero-tolerance string scan: banned privacy + banned repo name
+#   2. Public repo:  go vet, go build, tsc, vitest
+#   3. Core repo:    go vet, plain go build (matching only; no garble here)
+#
+# Each check writes a log under /tmp; on failure the last 20 lines are
+# echoed so the commit author can see what broke.
 
 set -e
 
 echo "Running pre-commit QA checks..."
 
-# 1. TypeScript check (fast)
-cd /root/goexchange/web
-if ! npx tsc --noEmit > /tmp/precommit-tsc.log 2>&1; then
-    echo "TypeScript errors found. Run 'cd web && npx tsc --noEmit' to see details."
-    cat /tmp/precommit-tsc.log | tail -20
+# 0. Zero-tolerance strings (privacy + repo rename).
+#    Scan ONLY the two git repos. Skip .git, build caches, vendored
+#    node_modules, build outputs. Do NOT scan the archived monorepo
+#    under /root/goexchange/ — it is intentionally frozen and not part
+#    of the new repo split.
+PRIVACY_FAIL=0
+for repo in /root/goexdev-public /root/goexdev-core; do
+    if [ -d "$repo" ]; then
+        if grep -rln -E 'awshrb|goexchange-public' \
+                --exclude-dir=.git \
+                --exclude-dir=node_modules \
+                --exclude-dir=dist \
+                --exclude-dir=.cache \
+                --exclude=pre-commit \
+                "$repo" > /tmp/precommit-privacy.log 2>&1; then
+            echo "FAIL: zero-tolerance string(s) found in $repo:"
+            cat /tmp/precommit-privacy.log
+            PRIVACY_FAIL=1
+        fi
+    fi
+done
+if [ "$PRIVACY_FAIL" = "1" ]; then
     exit 1
 fi
 
-# 2. Vitest unit tests (fast - ~2s)
-if ! ./node_modules/.bin/vitest run > /tmp/precommit-vitest.log 2>&1; then
-    echo "Frontend tests failed."
-    tail -20 /tmp/precommit-vitest.log
+# 1. Public repo: Go vet + build.
+cd /root/goexdev-public
+if ! /usr/local/go/bin/go vet ./... > /tmp/precommit-pub-vet.log 2>&1; then
+    echo "FAIL: public repo go vet"
+    tail -20 /tmp/precommit-pub-vet.log
+    exit 1
+fi
+if ! /usr/local/go/bin/go build ./... > /tmp/precommit-pub-build.log 2>&1; then
+    echo "FAIL: public repo go build"
+    tail -20 /tmp/precommit-pub-build.log
     exit 1
 fi
 
-# 3. Go build check (fast)
-cd /root/goexchange
-if ! /usr/local/go/bin/go build ./... > /tmp/precommit-go.log 2>&1; then
-    echo "Go build failed."
-    tail -20 /tmp/precommit-go.log
-    exit 1
+# 2. Public web: tsc + vitest (skip if web/node_modules missing).
+if [ -d /root/goexdev-public/web/node_modules ]; then
+    if ! (cd /root/goexdev-public/web && npx tsc --noEmit) > /tmp/precommit-tsc.log 2>&1; then
+        echo "FAIL: web tsc"
+        tail -20 /tmp/precommit-tsc.log
+        exit 1
+    fi
+    if ! (cd /root/goexdev-public/web && ./node_modules/.bin/vitest run) > /tmp/precommit-vitest.log 2>&1; then
+        echo "FAIL: web vitest"
+        tail -20 /tmp/precommit-vitest.log
+        exit 1
+    fi
+fi
+
+# 3. Core repo: vet + plain build of matching binary.
+#    Plain build (no garble) so we keep debug info; garble is only for the
+#    release image. Skip cleanly if the core repo is not on this machine.
+if [ -d /root/goexdev-core ]; then
+    cd /root/goexdev-core
+    if ! /usr/local/go/bin/go vet ./... > /tmp/precommit-core-vet.log 2>&1; then
+        echo "FAIL: core repo go vet"
+        tail -20 /tmp/precommit-core-vet.log
+        exit 1
+    fi
+    if ! GOTOOLCHAIN=auto /usr/local/go/bin/go build -o /tmp/precommit-matching ./cmd/matching > /tmp/precommit-core-build.log 2>&1; then
+        echo "FAIL: core repo go build (matching)"
+        tail -20 /tmp/precommit-core-build.log
+        exit 1
+    fi
+    rm -f /tmp/precommit-matching
 fi
 
 echo "Pre-commit checks passed"
