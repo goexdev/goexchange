@@ -24,8 +24,7 @@ and ships as a Docker image:
 - Image: `ghcr.io/goexdev/goexchange-core:latest`
 - Protocol: gRPC on port 50051
 - Source: private `goexchange-core` repository
-- License: commercial (Ed25519-signed license tokens issued by the
-  license server at `license.goexchange.top`)
+- Distribution: closed-source Docker image; commercial terms
 
 Detailed architecture, deployment, and operator runbooks are kept in
 the project's private documentation archive and are not mirrored here.

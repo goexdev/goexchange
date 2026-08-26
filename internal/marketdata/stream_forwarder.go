@@ -51,8 +51,8 @@ func NewStreamForwarder(src StreamSource, bus *EventBus, log *slog.Logger) *Stre
 //
 // The function is intentionally simple: connect once, drain until
 // done. A retry loop would mask serious issues (matching engine
-// unreachable, license revoked, etc.) and is better surfaced as a
-// process exit + supervisor restart.
+// unreachable, etc.) and is better surfaced as a process exit +
+// supervisor restart.
 func (f *StreamForwarder) Run(ctx context.Context) error {
 	events, err := f.client.StreamTrades(ctx)
 	if err != nil {
