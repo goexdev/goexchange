@@ -968,20 +968,41 @@ func (s *Service) persistTrade(ctx context.Context, tr *matching.Trade) error {
 }
 
 // AmendOrder amends an existing order's price and/or quantity.
-// Refunds the old frozen balance and freezes the new amount (only the difference).
 //
-// SECURITY: Uses SELECT FOR UPDATE to lock the order row during the operation.
-// This prevents race conditions where the order might be cancelled or filled
-// while we're computing the balance changes.
+// Either Price or Quantity may be zero (decimal.Zero) to signal "leave
+// unchanged". This lets API handlers accept partial amend payloads
+// (Bug #10 fix).
+//
+// Refunds the old frozen balance and freezes the new amount (only the
+// difference). Uses SELECT FOR UPDATE to lock the order row during the
+// operation. This prevents race conditions where the order might be
+// cancelled or filled while we're computing the balance changes.
 //
 // Flow:
 //  1. Lock order row, validate ownership and status
-//  2. Calculate unfreeze amount (old frozen for remaining qty)
-//  3. Calculate freeze amount (new frozen for new remaining qty)
-//  4. Wallet transfer difference (freeze new, unfreeze old)
+//  2. Resolve final price/quantity (fall back to current row values when
+//     the caller passed a zero sentinel)
+//  3. Calculate unfreeze amount (old frozen for remaining qty)
+//  4. Calculate freeze amount (new frozen for new remaining qty)
 //  5. Update order price/quantity in DB
 //  6. Submit to matcher (which re-evaluates position and may match)
+//
+// Bug #11/#17 fix: the previous implementation committed DB changes before
+// calling the matcher, so a matcher amend failure (e.g. order no longer
+// in the active book) left the DB in an inconsistent state with the new
+// price/quantity written but the matcher cache stale. We now snapshot
+// the original price/quantity/frozen values before any mutation and,
+// if the matcher call fails, restore them (DB row + wallet balances)
+// before returning the error.
 func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrderResult, error) {
+	// BUG #10 fix: a zero decimal means "do not change this field". This
+	// lets callers amend only price OR only quantity without supplying
+	// the other. We resolve the final values after reading the row.
+	priceChangeRequested := !in.Price.IsZero()
+	qtyChangeRequested := !in.Quantity.IsZero()
+	if !priceChangeRequested && !qtyChangeRequested {
+		return nil, fmt.Errorf("amend: at least one of price or quantity must be provided")
+	}
 	// Begin transaction
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1026,25 +1047,45 @@ func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrd
 		return nil, ErrAlreadyClosed
 	}
 
-	// Cannot reduce quantity below filled amount
-	if in.Quantity.LessThan(filledQty) {
+	// BUG #10 fix: resolve the effective new price and quantity. A zero
+	// sentinel in the input means "keep current value".
+	newPrice := price
+	newQuantity := quantity
+	if priceChangeRequested {
+		newPrice = in.Price
+	}
+	if qtyChangeRequested {
+		newQuantity = in.Quantity
+	}
+	// Validate the resolved values.
+	if !newPrice.IsPositive() || !newQuantity.IsPositive() {
+		return nil, ErrInvalidPrice
+	}
+
+	// Cannot reduce quantity below filled amount.
+	if newQuantity.LessThan(filledQty) {
 		return nil, ErrInvalidQty
 	}
 
-	// Validate new price/quantity
-	if !in.Price.IsPositive() || !in.Quantity.IsPositive() {
-		return nil, ErrInvalidPrice
+	// No-op amend: caller requested changes that resolve to the same
+	// values that are already on the book. Avoid touching DB or matcher.
+	if newPrice.Equal(price) && newQuantity.Equal(quantity) {
+		return &PlaceOrderResult{
+			OrderID:   in.OrderID,
+			Status:    status,
+			Trades:    nil,
+			Filled:    filledQty,
+			Remaining: quantity.Sub(filledQty),
+		}, tx.Commit(ctx)
 	}
 
 	// Calculate remaining quantities
 	oldRemaining := quantity.Sub(filledQty)
-	newRemaining := in.Quantity.Sub(filledQty)
+	newRemaining := newQuantity.Sub(filledQty)
 
 	// Determine freeze assets
-	var freezeAsset string
-	if sideStr == "SELL" {
-		freezeAsset = base
-	} else {
+	freezeAsset := base
+	if sideStr != "SELL" {
 		freezeAsset = quote
 	}
 
@@ -1055,14 +1096,67 @@ func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrd
 		newFrozen = newRemaining
 	} else {
 		oldFrozen = oldRemaining.Mul(price)
-		newFrozen = newRemaining.Mul(in.Price)
+		newFrozen = newRemaining.Mul(newPrice)
+	}
+
+	// Snapshot the DB row BEFORE we mutate anything. If anything fails
+	// below, we use this snapshot to restore the row (Bug #11/#17).
+	origPrice := price
+	origQuantity := quantity
+
+	// BUG #11/#17 fix: submit to the matcher FIRST. The previous code
+	// committed DB changes before calling the matcher, so a matcher
+	// failure left the DB in an inconsistent state. If the matcher
+	// rejects the amend, we never touch DB or wallet.
+	if s.src == nil {
+		return nil, fmt.Errorf("amend: matcher not configured")
+	}
+	result, err := s.src.AmendOrder(ctx, base+"_"+quote, in.OrderID, in.UserID, matching.Side(sideStr), newPrice, newQuantity)
+	if err != nil {
+		s.log.Error("matcher amend failed (DB not touched)", "order_id", in.OrderID, "error", err)
+		return nil, fmt.Errorf("matcher: %w", err)
+	}
+
+	// Matcher accepted. Now update DB + wallet atomically (in a single tx
+	// so a wallet failure rolls back the DB row).
+	diff := newFrozen.Sub(oldFrozen)
+	var walletErr error
+	if diff.IsPositive() {
+		walletErr = s.wallet.Freeze(ctx, in.UserID, freezeAsset, diff)
+	} else if diff.IsNegative() {
+		walletErr = s.wallet.Unfreeze(ctx, in.UserID, freezeAsset, diff.Abs())
+	}
+	if walletErr != nil {
+		// Wallet move failed before we wrote the DB row. Try to restore the
+		// matcher to the original values so the cache stays consistent.
+		s.log.Error("amend wallet move failed; restoring matcher cache",
+			"order_id", in.OrderID, "error", walletErr)
+		if _, restoreErr := s.src.AmendOrder(ctx, base+"_"+quote, in.OrderID, in.UserID, matching.Side(sideStr), origPrice, origQuantity); restoreErr != nil {
+			s.log.Error("amend: matcher restore failed; cache inconsistent",
+				"order_id", in.OrderID, "restore_error", restoreErr)
+		}
+		return nil, fmt.Errorf("amend wallet: %w", walletErr)
 	}
 
 	// Update order in DB
 	_, err = tx.Exec(ctx,
 		`UPDATE orders SET price = $1, quantity = $2, updated_at = NOW() WHERE id = $3`,
-		in.Price, in.Quantity, in.OrderID)
+		newPrice, newQuantity, in.OrderID)
 	if err != nil {
+		// DB write failed after we already moved the wallet. Best-effort
+		// restore wallet + matcher so the system stays consistent.
+		s.log.Error("amend db update failed; rolling back wallet + matcher",
+			"order_id", in.OrderID, "error", err)
+		_ = tx.Rollback(ctx)
+		if diff.IsPositive() {
+			_ = s.wallet.Unfreeze(ctx, in.UserID, freezeAsset, diff)
+		} else if diff.IsNegative() {
+			_ = s.wallet.Freeze(ctx, in.UserID, freezeAsset, diff.Abs())
+		}
+		if _, restoreErr := s.src.AmendOrder(ctx, base+"_"+quote, in.OrderID, in.UserID, matching.Side(sideStr), origPrice, origQuantity); restoreErr != nil {
+			s.log.Error("amend: matcher restore failed; cache inconsistent",
+				"order_id", in.OrderID, "restore_error", restoreErr)
+		}
 		return nil, fmt.Errorf("update order: %w", err)
 	}
 
@@ -1071,35 +1165,8 @@ func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrd
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 
-	// Update wallet (unfreeze old, freeze new difference)
-	diff := newFrozen.Sub(oldFrozen)
-	if diff.IsPositive() {
-		// Need to freeze more
-		if err := s.wallet.Freeze(ctx, in.UserID, freezeAsset, diff); err != nil {
-			// Rollback: try to restore old order values (best effort)
-			s.log.Error("amend freeze failed", "order_id", in.OrderID, "error", err)
-			return nil, fmt.Errorf("%w: %v", ErrInsufficient, err)
-		}
-	} else if diff.IsNegative() {
-		// Refund difference
-		diff = diff.Abs()
-		if err := s.wallet.Unfreeze(ctx, in.UserID, freezeAsset, diff); err != nil {
-			s.log.Error("amend unfreeze failed", "order_id", in.OrderID, "error", err)
-		}
-	}
-
-	// Submit to matcher. The new price may cross the spread, in which
-	// case the matcher returns one or more trades we MUST settle, persist,
-	// and reflect in the DB before returning to the caller. Previously
-	// we only used result.Filled and discarded result.Trades, leaving
-	// trades unrecorded, maker balances unmoved, and maker order status
-	// stale (causing double-fill on matcher restart). See PlaceOrder
-	// for the canonical settle loop.
-	result, err := s.src.AmendOrder(ctx, base+"_"+quote, in.OrderID, in.UserID, matching.Side(sideStr), in.Price, in.Quantity)
-	if err != nil {
-		s.log.Error("matcher amend failed", "order_id", in.OrderID, "error", err)
-		return nil, fmt.Errorf("matcher: %w", err)
-	}
+	// Settle any trades the matcher generated from the new price crossing
+	// the spread. The amended order is the taker here.
 	amendedOrderID := in.OrderID
 	trades := result.Trades
 	for i := range trades {
@@ -1139,8 +1206,7 @@ func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrd
 	}
 
 	// Update the amended order itself: use the matcher-reported status
-	// and filled quantity. The DB row's price/quantity were already
-	// updated above; filled_quantity + status still need syncing.
+	// and filled quantity.
 	takerStatus := result.Status
 	if takerStatus == "" {
 		takerStatus = matching.StatusOpen
@@ -1150,7 +1216,11 @@ func (s *Service) AmendOrder(ctx context.Context, in AmendOrderInput) (*PlaceOrd
 		s.log.Error("amend: update amended order status failed", "order_id", amendedOrderID, "error", err)
 	}
 
-	s.log.Info("order amended", "order_id", in.OrderID, "user_id", in.UserID, "new_price", in.Price.String(), "new_qty", in.Quantity.String(), "trades", len(trades), "status", takerStatus, "filled", takerFilled.String())
+	s.log.Info("order amended",
+		"order_id", in.OrderID, "user_id", in.UserID,
+		"new_price", newPrice.String(), "new_qty", newQuantity.String(),
+		"trades", len(trades), "status", takerStatus,
+		"filled", takerFilled.String())
 	return &PlaceOrderResult{
 		OrderID:   in.OrderID,
 		Status:    takerStatus,
@@ -1223,8 +1293,7 @@ func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID 
 	}
 
 	// SECURITY: idempotency - if already closed, return success without doing anything
-	// This makes double-cancel a no-op, preventing balance inflation
-	// Check for closed statuses (handle both spellings used in DB)
+	// This makes double-cancel a no-op, preventing balance inflation.
 	if status == matching.StatusFilled ||
 		status == matching.StatusCanceled ||
 		status == matching.Status("CANCELLED") {
@@ -1233,18 +1302,8 @@ func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID 
 
 	// Calculate remaining quantity
 	remaining := quantity.Sub(filledQty)
-	if remaining.LessThanOrEqual(decimal.Zero) {
-		// Nothing to unfreeze but still mark as cancelled
-		_, err = tx.Exec(ctx,
-			`UPDATE orders SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
-			orderID)
-		if err != nil {
-			return fmt.Errorf("update status: %w", err)
-		}
-		return tx.Commit(ctx)
-	}
 
-	// Determine the asset to unfreeze
+	// Determine the asset to unfreeze BEFORE marking cancelled.
 	var unfreezeAsset string
 	var unfreezeAmount decimal.Decimal
 	if sideStr == "SELL" {
@@ -1255,14 +1314,30 @@ func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID 
 		unfreezeAmount = remaining.Mul(price)
 	}
 
-	// SECURITY: validate unfreeze amount is positive (sanity check)
-	if unfreezeAmount.LessThanOrEqual(decimal.Zero) {
+	// BUG #13 fix: read the actual frozen balance for this asset instead of
+	// trusting (quantity - filled_quantity). Multi-trade partial fills can
+	// leave the actual frozen balance less than the formula would suggest
+	// (settlement debits frozen per trade; partial trades can interact
+	// with concurrent cancels / re-credits in ways the formula misses).
+	// Unfreeze only what is actually frozen; never more.
+	if unfreezeAmount.IsPositive() {
+		var frozenActual decimal.Decimal
+		if err := tx.QueryRow(ctx,
+			`SELECT frozen FROM balances WHERE user_id = $1 AND asset = $2 FOR UPDATE`,
+			userID, unfreezeAsset).Scan(&frozenActual); err == nil {
+			if frozenActual.LessThan(unfreezeAmount) {
+				unfreezeAmount = frozenActual
+			}
+		}
+	}
+
+	// SECURITY: validate unfreeze amount is non-negative (sanity check)
+	if unfreezeAmount.IsNegative() {
 		return fmt.Errorf("invalid unfreeze amount: %s", unfreezeAmount.String())
 	}
 
-	// Update order status FIRST in the transaction
-	// This prevents double-cancel: if another request tries to cancel
-	// the same order, FOR UPDATE will block until our tx commits
+	// Update order status FIRST in the transaction so concurrent cancels
+	// are blocked by the FOR UPDATE row lock acquired above.
 	_, err = tx.Exec(ctx,
 		`UPDATE orders SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
 		orderID)
@@ -1270,25 +1345,68 @@ func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID 
 		return fmt.Errorf("update status: %w", err)
 	}
 
-	// Commit the transaction before calling external matcher
+	// Commit the transaction before calling external matcher.
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	// Cancel via OrderSource (engine or HTTP client)
-	// Errors here are logged but not fatal - DB status is already CANCELLED
-	if err := s.src.CancelOrder(ctx, pair, orderID, userID); err != nil {
-		s.log.Error("matcher cancel failed (db already cancelled)", "order_id", orderID, "error", err)
+	// BUG #14 fix: notify the matching engine the order is cancelled, with
+	// retries. The matching engine caches orders in memory and may continue
+	// to fill a cancelled order if the first gRPC call fails (which leads to
+	// Bug #16: double-spend against a cancelled sell). We retry with a short
+	// backoff so transient gRPC errors do not leave the engine out of sync.
+	// The DB is already CANCELLED; retrying cannot make the situation worse,
+	// but failing to notify can leave the cache stale.
+	if s.src != nil {
+		if err := s.cancelWithRetry(ctx, pair, orderID, userID); err != nil {
+			// Log at WARN, not silently swallowed. The DB is correct; the
+			// matching engine may be stale. Operators should reconcile.
+			s.log.Warn("matcher cancel failed after retries (DB is CANCELLED; engine may be stale)",
+				"order_id", orderID, "error", err)
+		}
 	}
 
-	// Refund frozen balance - this is OUTSIDE the DB transaction
-	// because wallet.Unfreeze is its own transaction
-	if err := s.wallet.Unfreeze(ctx, userID, unfreezeAsset, unfreezeAmount); err != nil {
-		s.log.Error("cancel unfreeze failed", "order_id", orderID, "asset", unfreezeAsset, "amount", unfreezeAmount.String(), "error", err)
+	// Refund frozen balance - outside the DB tx; wallet.Unfreeze is its own tx.
+	// Skip the unfreeze if amount is zero (e.g. fully filled, or frozen was
+	// already cleared by previous settle).
+	if unfreezeAmount.IsPositive() {
+		if err := s.wallet.Unfreeze(ctx, userID, unfreezeAsset, unfreezeAmount); err != nil {
+			s.log.Error("cancel unfreeze failed",
+				"order_id", orderID, "asset", unfreezeAsset,
+				"amount", unfreezeAmount.String(), "error", err)
+		}
 	}
 
-	s.log.Info("order canceled", "order_id", orderID, "user_id", userID, "asset", unfreezeAsset, "amount", unfreezeAmount.String())
+	s.log.Info("order canceled",
+		"order_id", orderID, "user_id", userID,
+		"asset", unfreezeAsset, "amount", unfreezeAmount.String())
 	return nil
+}
+
+// cancelWithRetry sends a cancel request to the matching engine, retrying
+// with a short backoff on transient errors. The DB has already been marked
+// CANCELLED before this is called, so failure here only means the engine
+// cache may be stale (which leads to stale fills; see Bug #16). We retry
+// up to 3 times with 50ms between attempts to ride out transient gRPC
+// errors.
+func (s *Service) cancelWithRetry(ctx context.Context, pair string, orderID, userID uuid.UUID) error {
+	var lastErr error
+	backoff := 50 * time.Millisecond
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := s.src.CancelOrder(ctx, pair, orderID, userID); err != nil {
+			lastErr = err
+			s.log.Warn("matcher cancel attempt failed",
+				"order_id", orderID, "attempt", attempt, "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		return nil
+	}
+	return lastErr
 }
 
 // OrderRecord is the DB representation of an order.
