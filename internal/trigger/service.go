@@ -88,13 +88,20 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*TriggerOrder, er
 		return nil, fmt.Errorf("side must be BUY or SELL")
 	}
 
+	// BUG #26 fix: explicitly assign an id so we don't depend on the
+	// database column having a DEFAULT gen_random_uuid() clause. Some
+	// older migration paths (notably the 0022_trigger_orders bootstrap
+	// migration) create the id column as NOT NULL without a default,
+	// so a bare INSERT without an id fails with "null value in column
+	// 'id' violates not-null constraint".
 	var t TriggerOrder
+	t.ID = uuid.New()
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO trigger_orders (user_id, pair, side, trigger_type, trigger_price, quantity)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO trigger_orders (id, user_id, pair, side, trigger_type, trigger_price, quantity)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, user_id, pair, side, trigger_type, trigger_price, quantity, status,
 				   triggered_at, triggered_order_id, cancelled_at, created_at, updated_at`,
-		in.UserID, in.Pair, in.Side, string(in.TriggerType),
+		t.ID, in.UserID, in.Pair, in.Side, string(in.TriggerType),
 		in.TriggerPrice.String(), in.Quantity.String(),
 	).Scan(&t.ID, &t.UserID, &t.Pair, &t.Side, &t.TriggerType, &t.TriggerPrice,
 		&t.Quantity, &t.Status, &t.TriggeredAt, &t.TriggeredOrderID,
