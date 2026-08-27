@@ -42,14 +42,14 @@ db-migrate: migrate-tool
 
 db-reset:
 	@read -p "Drop and recreate DB? [y/N] " r && [ "$$r" = "y" ] || exit 1
-	docker exec -it goexchange-postgres-1 psql -U exchange -d postgres \
+	docker exec -it goexchange-postgres psql -U exchange -d postgres \
 		-c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='exchange' AND pid <> pg_backend_pid();" >/dev/null
-	docker exec -it goexchange-postgres-1 psql -U exchange -d postgres \
+	docker exec -it goexchange-postgres psql -U exchange -d postgres \
 		-c "DROP DATABASE IF EXISTS exchange; CREATE DATABASE exchange;"
 	$(MAKE) db-migrate
 
 db-shell:
-	docker exec -it goexchange-postgres-1 psql -U exchange -d exchange
+	docker exec -it goexchange-postgres psql -U exchange -d exchange
 
 # ---------- build/run ----------
 .PHONY: build run test lint fmt clean
