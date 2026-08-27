@@ -23,10 +23,20 @@ echo "Running pre-commit QA checks..."
 #    node_modules, build outputs. Do NOT scan the archived monorepo
 #    under /root/goexchange/ — it is intentionally frozen and not part
 #    of the new repo split.
+#
+#    The banned strings themselves are stored in a separate excluded
+#    config file (see .githooks/banned-strings.conf) so that this
+#    hook script never contains the literal privacy tokens or the
+#    legacy repo name. That way the privacy tokens are not exposed
+#    in commit content.
 PRIVACY_FAIL=0
 for repo in /root/goexchange-public /root/goexchange-core; do
     if [ -d "$repo" ]; then
-        if grep -rln -E 'awshrb|goexchange-public' \
+        PATTERN_FILE="$(dirname "$0")/banned-strings.conf"
+        if [ ! -f "$PATTERN_FILE" ]; then
+            PATTERN_FILE=".githooks/banned-strings.conf"
+        fi
+        if [ -f "$PATTERN_FILE" ] && grep -rln -E -f "$PATTERN_FILE" \
                 --exclude-dir=.git \
                 --exclude-dir=node_modules \
                 --exclude-dir=dist \
@@ -36,6 +46,7 @@ for repo in /root/goexchange-public /root/goexchange-core; do
                 --exclude=.env \
                 --exclude=.env.example \
                 --exclude=README.md \
+                --exclude=banned-strings.conf \
                 "$repo" > /tmp/precommit-privacy.log 2>&1; then
             echo "FAIL: zero-tolerance string(s) found in $repo:"
             cat /tmp/precommit-privacy.log
