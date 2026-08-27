@@ -437,113 +437,18 @@ type Withdrawal struct {
 	RiskHold      bool
 }
 
-// Withdraw debits user balance, sends asset to address, persists withdrawal.
-func (s *Service) Withdraw(ctx context.Context, userID uuid.UUID, asset, toAddress string, amount decimal.Decimal) (*Withdrawal, error) {
-	if !amount.IsPositive() {
-		return nil, ErrInvalidAmount
-	}
-	// 0. Check KYC withdrawal limit (M3)
-	if err := s.WithdrawLimitCheck(ctx, userID, amount); err != nil {
-		return nil, err
-	}
-	var err error // declared for computeFee/GetAvailable below
-	// 1. Compute risk score (M4)
-	riskScore := s.computeWithdrawRisk(ctx, userID, amount, toAddress)
-	riskAction := risk.ActionForScore(riskScore)
-	// 2. Insert withdrawal record (HOLD if high risk, PENDING otherwise)
-	status := "PENDING"
-	if riskAction == risk.ActionHold {
-		status = "HOLD"
-	} else if riskAction == risk.ActionBlock {
-		return nil, fmt.Errorf("withdrawal blocked by risk control (score: %d): %w", riskScore, ErrWithdrawalBlocked)
-	}
-	// 1. Insert withdrawal record (PENDING)
-	riskHold := riskAction == risk.ActionHold
-	w := &Withdrawal{
-		ID:          uuid.New(),
-		UserID:      userID,
-		Asset:       asset,
-		Amount:      amount,
-		DestAddress: toAddress,
-		Chain:       s.chainForAsset(asset),  // dynamic: BNB→bsc, ETH→eth, etc.
-		Status:      status,
-		RiskScore:   riskScore,
-		RiskHold:    riskHold,
-		CreatedAt:   time.Now().UTC(),
-	}
-	const insertQ = `
-		INSERT INTO withdrawals (id, user_id, asset, amount, dest_address, chain, status, risk_score, risk_hold, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
-	_, err = s.pool.Exec(ctx, insertQ, w.ID, w.UserID, w.Asset, w.Amount, w.Fee, w.ReceiveAmount, w.DestAddress, w.Chain, w.Status, riskScore, riskHold, w.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	// 2. If on HOLD (admin review required), skip debit + broadcast
-	if riskHold {
-		s.log.Info("withdrawal on hold pending admin review", "withdrawal_id", w.ID, "risk_score", riskScore)
-		return w, nil
-	}
-	// 3. Debit user balance (atomic)
-	if err := s.wallet.DebitAvailable(ctx, userID, asset, amount); err != nil {
-		s.failWithdrawal(ctx, w.ID, err.Error())
-		return nil, err
-	}
-	// 4. Send via the right driver
-	// Use registry to find the correct driver for this asset (data-driven, no hardcoded mapping).
-	drv := s.driverForAsset(asset)
-	if drv == nil {
-		errMsg := fmt.Sprintf("no driver for asset %s", asset)
-		_ = s.wallet.Credit(ctx, userID, asset, amount)
-		s.failWithdrawal(ctx, w.ID, errMsg)
-		return nil, fmt.Errorf("%s", errMsg)
-	}
-	// Check if this is a token transfer (e.g. ERC20/BEP-20)
-	var txHash string
-	tokenCfg := s.getTokenConfig(asset)
-	if tokenCfg != nil {
-		// Token transfer (e.g. USDT on BSC)
-		txHash, err = s.sendTokenWithdrawal(ctx, drv, tokenCfg, toAddress, amount)
-	} else {
-		// Native token transfer (e.g. BNB, ETH)
-		txHash, err = drv.SendToAddress(ctx, asset, toAddress, amount)
-	}
-	if err != nil {
-		// Refund + mark FAILED
-		_ = s.wallet.Credit(ctx, userID, asset, amount)
-		s.failWithdrawal(ctx, w.ID, err.Error())
-		return nil, err
-	}
-	// 4. Update to BROADCAST
-	sentAt := time.Now().UTC()
-	_, err = s.pool.Exec(ctx, `
-		UPDATE withdrawals SET tx_hash = $1, status = 'BROADCAST', sent_at = $2
-		WHERE id = $3
-	`, txHash, sentAt, w.ID)
-	if err != nil {
-		s.log.Warn("failed to update withdrawal", "error", err)
-	}
-	w.TxHash = txHash
-	w.Status = "BROADCAST"
-	w.SentAt = &sentAt
-
-	// Trigger: large withdrawal notification (> 500 USDT equivalent)
-	if amount.GreaterThan(decimal.NewFromInt(500)) {
-		s.notifier.SendNotification(ctx, userID, notifier.TypeLargeWithdraw,
-			"Large Withdrawal Detected",
-			fmt.Sprintf("Withdrawal of %s %s to %s is being broadcast.", amount.String(), asset, toAddress[:10]),
-			map[string]any{"withdrawal_id": w.ID.String(), "amount": amount.String(), "asset": asset})
-	}
-
-	return w, nil
-}
-
 // WithdrawWithSigner is the production withdrawal flow that uses the
 // signer service for signing and node-proxy for broadcasting.
 //
 // This is the recommended flow for production deployments where:
 //   - Private keys are in Vault (not on the exchange server)
 //   - Node servers are in separate subnets (read-only + broadcast only)
+//
+// Note: an older Withdraw() function existed with an INSERT that passed
+// 12 parameters against a 10-placeholder SQL string. That function was
+// dead code (no callers — the API handler uses WithdrawWithSigner below)
+// and has been removed (Bug #22 fix).
+//
 // computeFee returns the withdrawal fee for an asset amount.
 // Formula: max(flat, amount * percent), then max(fee, min)
 func (s *Service) computeFee(ctx context.Context, asset string, amount decimal.Decimal) (decimal.Decimal, error) {
