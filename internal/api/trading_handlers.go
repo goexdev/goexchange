@@ -612,15 +612,32 @@ func amendOrderHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid body")
 			return
 		}
-		price, err := decimal.NewFromString(body.Price)
-		if err != nil || !price.IsPositive() {
-			writeError(w, http.StatusBadRequest, "invalid price")
+		// BUG #10 fix: at least one of price/quantity must be supplied.
+		// Empty string means "leave unchanged" for that field. This lets
+		// clients amend just the price or just the quantity.
+		if body.Price == "" && body.Quantity == "" {
+			writeError(w, http.StatusBadRequest, "must supply price or quantity")
 			return
 		}
-		quantity, err := decimal.NewFromString(body.Quantity)
-		if err != nil || !quantity.IsPositive() {
-			writeError(w, http.StatusBadRequest, "invalid quantity")
-			return
+		// Parse whatever was supplied. Use decimal.Zero as the sentinel
+		// meaning "leave unchanged" — the service layer checks IsZero().
+		var price decimal.Decimal
+		if body.Price != "" {
+			var err error
+			price, err = decimal.NewFromString(body.Price)
+			if err != nil || price.IsNegative() {
+				writeError(w, http.StatusBadRequest, "invalid price")
+				return
+			}
+		}
+		var quantity decimal.Decimal
+		if body.Quantity != "" {
+			var err error
+			quantity, err = decimal.NewFromString(body.Quantity)
+			if err != nil || quantity.IsNegative() {
+				writeError(w, http.StatusBadRequest, "invalid quantity")
+				return
+			}
 		}
 
 		result, err := d.TradingSvc.AmendOrder(r.Context(), trading.AmendOrderInput{
