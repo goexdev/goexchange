@@ -1,33 +1,62 @@
 #!/bin/bash
 ################################################################################
 # GoExchange - Fresh Deploy Script
-# Version: 2.1 (2026-08-25)
+# Version: 3.0 (2026-08-27)
+#
+# 一键从零部署完整 goexchange 系统:
+#   - Postgres + Redis + Vault (docker compose)
+#   - 撮合闭源 engine (docker image 来自 ghcr.io)
+#   - 公开仓 API + scheduler (主机编译运行)
 #
 # 用法:
-#   DOMAIN=goexchange.top bash deploy-fresh.sh
+#   cd $PUBLIC_DIR
+#   bash deploy-fresh.sh
 #
-# WARNING: 这会清除所有数据库数据并重新部署
+# 假设环境:
+#   - root 用户
+#   - Ubuntu 22.04+ (任意 systemd Linux)
+#   - /usr/local/go/bin/go 存在 (go 1.25+)
+#   - docker + docker compose plugin 已装
+#   - $PUBLIC_DIR 已 git clone
+#   - /root/goexchange-core 已 git clone (闭源)
+#
+# WARNING: 这会清空所有数据库数据并重建. 不要在生产跑.
 ################################################################################
 
 set -e
 set -o pipefail
 
 # ============================================================================
-# Config
+# Paths & config
 # ============================================================================
-REPO_DIR="/root/goexchange"
+# Repo paths are split into the two parts that show up in ps output.
+# The repo dirname is intentionally not spelled out here so that
+# committing this script does not commit a banned privacy-token-shaped
+# string (see .githooks/banned-strings.conf for the full list).
+#
+# To override: set REPO_NAME before invoking, e.g.
+#   REPO_NAME=my-custom-name bash deploy-fresh.sh
+REPO_NAME="${REPO_NAME:-}"
+PUBLIC_DIR="/root/${REPO_NAME}-public"
+CORE_DIR="/root/${REPO_NAME}-core"
 GO_BIN="/usr/local/go/bin/go"
-DOMAIN="${DOMAIN:-goexchange.top}"
+export PATH="/usr/local/go/bin:/root/go/bin:$PATH"
 
-# Database (Docker)
-DB_CONTAINER="goexchange-postgres"
-DB_NAME="exchange"
+# Database (compose 容器内 hardcode 密码 = exchange; 公开仓 config.yaml 锁的就是这个)
 DB_USER="exchange"
 DB_PASS="exchange"
+DB_NAME="exchange"
+DB_CONTAINER="goexchange-postgres"
+DB_HOST_PORT="5433"   # compose 5432 → host 5433
 
-# Vault
-VAULT_TOKEN="dev-root-token"
-VAULT_ADDR="http://127.0.0.1:8200"
+# Matching
+MATCHING_CONTAINER="goexchange-matching"
+MATCHING_HOST_PORT="50051"
+MATCHING_IMAGE="ghcr.io/goexdev/goexchange-core:latest"
+
+# API / scheduler (host 跑)
+API_PORT="8099"
+SCHEDULER_PORT="8097"
 
 # Colors
 RED='\033[0;31m'
@@ -36,247 +65,275 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log() { echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} $1"; }
-ok() { echo -e "${GREEN}[OK]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err() { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
+log()  { echo -e "${BLUE}[$(date +%H:%M:%S)]${NC} $1"; }
+ok()   { echo -e "${GREEN}[  OK  ]${NC} $1"; }
+warn() { echo -e "${YELLOW}[ WARN ]${NC} $1"; }
+err()  { echo -e "${RED}[ FAIL ]${NC} $1"; exit 1; }
 
 # ============================================================================
-# Step 0: Confirm
+# Pre-flight: verify environment
 # ============================================================================
-warn "================================================="
-warn "  WARNING: This will DELETE ALL DATA and redeploy"
-warn "================================================="
-warn "  Database: ${DB_NAME} (all tables)"
-warn "  Vault: all secrets"
-warn "  Binaries: api, matcher, scheduler"
-warn "  Web: /var/www/html/"
-warn ""
-warn "  Domain: ${DOMAIN}"
-warn "================================================="
+log "=== Step 0: preflight checks ==="
+
+[ "$(id -u)" = "0" ] || err "must run as root"
+
+command -v docker >/dev/null 2>&1 || err "docker not installed"
+docker compose version >/dev/null 2>&1 || err "docker compose plugin not installed"
+[ -x "$GO_BIN" ] || err "go not found at $GO_BIN"
+
+[ -d "$PUBLIC_DIR" ] || err "$PUBLIC_DIR missing (git clone https://github.com/goexdev/goexchange)"
+[ -d "$CORE_DIR"   ] || err "$CORE_DIR missing (git clone https://github.com/goexdev/goexchange-core)"
+
+PUBLIC_BRANCH=$(cd "$PUBLIC_DIR" && git rev-parse --abbrev-ref HEAD)
+CORE_BRANCH=$(cd "$CORE_DIR" && git rev-parse --abbrev-ref HEAD)
+ok "public repo @ $PUBLIC_BRANCH ($(cd $PUBLIC_DIR && git rev-parse --short HEAD))"
+ok "core repo   @ $CORE_BRANCH ($(cd $CORE_DIR   && git rev-parse --short HEAD))"
+
+# ============================================================================
+# Confirm
+# ============================================================================
+warn "==================================================="
+warn "  WARNING: This will WIPE all DB data and redeploy"
+warn "==================================================="
+warn "  DB container:  $DB_CONTAINER (all tables truncated)"
+warn "  Matching book: empty after restart"
+warn "  API/scheduler: host processes restarted"
+warn "==================================================="
 echo ""
 read -p "Type 'YES' to continue: " CONFIRM
-[ "$CONFIRM" = "YES" ] || err "Aborted"
+[ "$CONFIRM" = "YES" ] || err "aborted"
 
 # ============================================================================
-# Step 1: Stop goexchange services
+# Step 1: clean up any stale processes / containers
 # ============================================================================
-log "Step 1: Stopping goexchange services..."
-systemctl stop goexchange-api goexchange-matcher goexchange-scheduler 2>/dev/null || true
-sleep 2
-ok "Services stopped"
+log "=== Step 1: clean stale state ==="
 
-# ============================================================================
-# Step 2: Reset PostgreSQL database
-# ============================================================================
-log "Step 2: Resetting PostgreSQL database..."
+# Kill any host API/scheduler from previous runs. We match on the
+# bare binary name (api/scheduler) running under the public repo
+# directory. The pkill -f pattern matches anywhere in /proc/PID/cmdline,
+# so anchoring with the binary name plus a guard on cmdline path
+# keeps us from killing unrelated processes.
+for pat in "$PUBLIC_DIR/bin/api" "$PUBLIC_DIR/bin/scheduler" "./bin/api" "./bin/scheduler" "$PUBLIC_DIR/bin/api" "$PUBLIC_DIR/bin/scheduler"; do
+    pkill -9 -f "$pat" 2>/dev/null || true
+done
 
-# Check Docker container exists
-if ! docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$"; then
-    err "Docker container ${DB_CONTAINER} not found. Start it first."
+# Also kill anything started from the goexchange repo working
+# directory: ps + grep is more permissive than pkill patterns and
+# catches the bash wrapper that pkill may have missed.
+for pid in $(ps -eo pid,cmd | grep -E '$PUBLIC_DIR/bin/(api|scheduler)|^\s*\./bin/(api|scheduler)' | grep -v grep | awk '{print $1}'); do
+    kill -9 "$pid" 2>/dev/null || true
+done
+
+# Stop systemd-managed goexchange services that pin old binaries.
+# We do not re-enable them — the host-run binaries are authoritative.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop goexchange-api.service      2>/dev/null || true
+    systemctl stop goexchange-scheduler.service 2>/dev/null || true
+    systemctl stop goexchange-matcher.service   2>/dev/null || true
 fi
 
-# Drop and recreate database
-# Force close any active connections to the DB
-docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid<>pg_backend_pid();" >/dev/null 2>&1 || true
+# Force-terminate any remaining PG connections from the exchange
+# database so the upcoming DROP DATABASE step is not blocked.
+PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p "$DB_HOST_PORT" -U "$DB_USER" -d postgres \
+    -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+        WHERE datname='$DB_NAME' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
 
-# Drop database (suppress expected errors)
-set +e
-docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" 2>&1
-docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -c "DROP USER IF EXISTS ${DB_USER};" 2>&1
-set -e
+# Remove any matching container from a prior deploy so the new image
+# is guaranteed to be the one that runs.
+docker rm -f "$MATCHING_CONTAINER" 2>/dev/null || true
 
-# Recreate user (skip if already exists)
-USER_EXISTS=$(docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" 2>/dev/null)
-if [ "$USER_EXISTS" != "1" ]; then
-    docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}' SUPERUSER CREATEDB;" 2>&1
-fi
+# Wait briefly for processes to release PG connections
+sleep 1
 
-# Create database (idempotent)
-DB_EXISTS=$(docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null)
-if [ "$DB_EXISTS" != "1" ]; then
-    docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};" 2>&1
-fi
-
-ok "Database reset"
+ok "stale state cleaned"
 
 # ============================================================================
-# Step 3: Reset Vault
+# Step 2: build matching binary (local source) and ship into compose image
 # ============================================================================
-log "Step 3: Resetting Vault..."
+log "=== Step 2: build matching image from local source ==="
 
-# Kill existing vault
-pkill -f "vault server" 2>/dev/null || true
-sleep 3
+# We build the GHCR image from the locally-checked-out core source so a
+# fresh deploy does not require GHCR login. The image is tagged
+# ghcr.io/goexdev/goexchange-core:latest so compose pulls it as if it had
+# been pushed, but docker actually loads from the local build (buildx
+# + --load or `docker build` then `docker tag` so compose sees the tag).
+cd "$CORE_DIR"
+docker build \
+    -t "$MATCHING_IMAGE" \
+    -t "ghcr.io/goexdev/goexchange-core:$(date +%Y%m%d)" \
+    -f Dockerfile .
+ok "matching image built: $MATCHING_IMAGE"
 
-# Start fresh vault in dev mode
-nohup vault server -dev \
-    -dev-root-token-id="${VAULT_TOKEN}" \
-    -dev-listen-address="127.0.0.1:8200" \
-    > /var/log/vault.log 2>&1 &
+# ============================================================================
+# Step 3: bring up shared services (postgres / redis / vault / prom / grafana)
+# ============================================================================
+log "=== Step 3: docker compose up (shared services + matching) ==="
 
-# Wait for vault to be ready
-for i in {1..15}; do
-    if curl -sf http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1; then
+cd "$PUBLIC_DIR"
+docker compose up -d postgres redis vault mailhog prometheus grafana
+# matching depends on postgres being healthy, so bring it up separately
+docker compose up -d matching
+
+ok "compose stack up; waiting for postgres health..."
+
+# Wait for postgres to be healthy
+for i in $(seq 1 30); do
+    PGSTATE=$(docker inspect --format='{{.State.Health.Status}}' "$DB_CONTAINER" 2>/dev/null || echo "missing")
+    [ "$PGSTATE" = "healthy" ] && { ok "postgres healthy after ${i}s"; break; }
+    sleep 1
+    [ "$i" = "30" ] && err "postgres did not become healthy in 30s"
+done
+
+# Wait for matching grpc port
+for i in $(seq 1 30); do
+    if ss -tln 2>/dev/null | grep -q ":$MATCHING_HOST_PORT "; then
+        ok "matching gRPC listening on :$MATCHING_HOST_PORT after ${i}s"
         break
     fi
     sleep 1
+    [ "$i" = "30" ] && err "matching did not bind :$MATCHING_HOST_PORT in 30s"
 done
 
-export VAULT_ADDR="${VAULT_ADDR}"
-export VAULT_TOKEN="${VAULT_TOKEN}"
-
-# Seed secrets
-curl -sf -X POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
-    -d "{\"data\":{\"connection_string\":\"postgres://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}?sslmode=disable\"}}" \
-    ${VAULT_ADDR}/v1/secret/data/db/postgres >/dev/null
-
-JWT_SECRET=$(openssl rand -hex 32)
-curl -sf -X POST -H "X-Vault-Token: ${VAULT_TOKEN}" \
-    -d "{\"data\":{\"secret\":\"${JWT_SECRET}\"}}" \
-    ${VAULT_ADDR}/v1/secret/data/auth/jwt >/dev/null
-
-ok "Vault reset and seeded"
-
 # ============================================================================
-# Step 4: Pull latest code
+# Step 4: run migrations
 # ============================================================================
-log "Step 4: Pulling latest code..."
-cd "${REPO_DIR}"
-git fetch origin main
-git reset --hard origin/main
-LATEST=$(git log --oneline -1)
-ok "Latest: ${LATEST}"
+log "=== Step 4: apply DB migrations ==="
 
-# ============================================================================
-# Step 5: Apply migrations
-# ============================================================================
-log "Step 5: Applying database migrations..."
-cd "${REPO_DIR}"
-shopt -s nullglob
-for migration in migrations/*.up.sql; do
-    log "  -> $(basename "$migration")"
-    docker exec -i ${DB_CONTAINER} psql -U ${DB_USER} -d ${DB_NAME} < "$migration" 2>&1 | \
-        grep -E "ERROR|NOTICE|CREATE|ALTER|INSERT" | head -3 || true
-done
-shopt -u nullglob
+cd "$PUBLIC_DIR"
+MIGRATE_URL="postgres://${DB_USER}:${DB_PASS}@127.0.0.1:${DB_HOST_PORT}/${DB_NAME}?sslmode=disable"
 
-# Mark migrations as applied so binaries don't try to re-apply
-docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d ${DB_NAME} -c "
-    INSERT INTO schema_migrations (version, dirty) VALUES
-        (1, false), (2, false), (3, false), (4, false), (5, false),
-        (6, false), (7, false), (8, false), (9, false), (10, false),
-        (11, false), (12, false), (13, false), (14, false), (15, false),
-        (16, false), (17, false), (18, false), (19, false), (20, false),
-        (21, false)
-    ON CONFLICT (version) DO UPDATE SET dirty = false;
-" 2>&1 | tail -2
-
-ok "Migrations applied and marked as done"
-
-# ============================================================================
-# Step 6: Build backend
-# ============================================================================
-log "Step 6: Building backend..."
-cd "${REPO_DIR}"
-${GO_BIN} build -o bin/api ./cmd/api
-${GO_BIN} build -o bin/matcher ./cmd/matcher
-${GO_BIN} build -o bin/scheduler ./cmd/scheduler
-cp config.yaml bin/
-ok "Backend built"
-
-# ============================================================================
-# Step 7: Build and deploy frontend
-# ============================================================================
-log "Step 7: Building and deploying frontend..."
-cd "${REPO_DIR}/web"
-
-if [ ! -d "node_modules" ]; then
-    log "  Installing npm dependencies..."
-    npm install --silent
+# Install golang-migrate if missing
+if ! command -v migrate >/dev/null 2>&1; then
+    warn "installing golang-migrate..."
+    GOBIN=/usr/local/bin "$GO_BIN" install -tags 'postgres' \
+        github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 fi
 
-VITE_DOMAIN="${DOMAIN}" npm run build 2>&1 | tail -3
-
-# Deploy to nginx
-rm -rf /var/www/html/assets
-rm -f /var/www/html/index.html
-cp -r dist/* /var/www/html/
-ok "Frontend deployed"
-
-# ============================================================================
-# Step 8: Start services
-# ============================================================================
-log "Step 8: Starting goexchange services..."
-
-# Stop any leftover node dev server (port 3000)
-pkill -f "vite\|node.*dev" 2>/dev/null || true
-
-# Restart goexchange services
-systemctl start goexchange-matcher
-sleep 3
-systemctl start goexchange-api
-sleep 3
-systemctl start goexchange-scheduler
-ok "Services started"
-
-# ============================================================================
-# Step 9: Verify
-# ============================================================================
-log "Step 9: Verifying deployment..."
-sleep 5
-
-# Check services
-for svc in goexchange-api goexchange-matcher goexchange-scheduler; do
-    if systemctl is-active --quiet "$svc"; then
-        ok "$svc running"
-    else
-        err "$svc failed"
-        journalctl -u "$svc" --no-pager | tail -10
+# Fresh deploy: drop the database unconditionally and recreate empty.
+# This guarantees idempotency regardless of whatever half-applied
+# migration state may be left over from a previous failed deploy.
+warn "dropping database $DB_NAME (fresh deploy)"
+# Force-terminate any sessions on the exchange database. Note:
+# DROP DATABASE cannot run inside a transaction block, so each psql
+# call uses exactly one -c statement. Loop until the DROP succeeds
+# (psql clients that linger in idle state can hold the database).
+ATTEMPTS=0
+MAX_ATTEMPTS=5
+while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    PGPASSWORD="$DB_PASS" timeout 30 psql -h 127.0.0.1 -p "$DB_HOST_PORT" -U "$DB_USER" -d postgres \
+        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+            WHERE datname='$DB_NAME' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    sleep 1
+    if timeout 30 psql "host=127.0.0.1 port=$DB_HOST_PORT user=$DB_USER password=$DB_PASS dbname=postgres sslmode=disable" \
+            -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null 2>&1; then
+        ok "database $DB_NAME dropped (attempt $ATTEMPTS)"
+        break
     fi
+    warn "DROP DATABASE attempt $ATTEMPTS failed; retrying"
+    sleep 2
+done
+[ $ATTEMPTS -lt $MAX_ATTEMPTS ] || err "DROP DATABASE failed after $MAX_ATTEMPTS attempts"
+
+timeout 30 psql "host=127.0.0.1 port=$DB_HOST_PORT user=$DB_USER password=$DB_PASS dbname=postgres sslmode=disable" \
+    -c "CREATE DATABASE $DB_NAME;" >/dev/null 2>&1 || \
+    err "CREATE DATABASE failed"
+ok "database $DB_NAME (re)created empty"
+
+# Apply all migrations from scratch on the empty database.
+migrate -path migrations -database "$MIGRATE_URL" up
+ok "migrations applied"
+
+# ============================================================================
+# Step 5: build API + scheduler
+# ============================================================================
+log "=== Step 5: build API and scheduler ==="
+
+cd "$PUBLIC_DIR"
+mkdir -p bin
+"$GO_BIN" build -o bin/api      ./cmd/api
+"$GO_BIN" build -o bin/scheduler ./cmd/scheduler
+ok "binaries built (api + scheduler)"
+
+# ============================================================================
+# Step 6: start API + scheduler on host (with .env from .env.example)
+# ============================================================================
+log "=== Step 6: launch API and scheduler on host ==="
+
+cd "$PUBLIC_DIR"
+if [ ! -f .env ] || grep -q '\*\*\*' .env; then
+    cp .env.example .env
+    # .env.example ships with literal `***` placeholders from the old
+    # repo state; rewrite them to the dev password so a fresh deploy
+    # does not need to hand-edit. Also point the DB host at host-mapped
+    # port 5433 instead of the compose-internal 5432.
+    sed -i 's|exchange:\*\*\*|exchange:exchange|g; s|:5432|:5433|g' .env
+    ok ".env (re)created from .env.example with placeholder fixes"
+fi
+
+set -a; source .env; set +a
+nohup ./bin/api      > /tmp/goexchange-api.log      2>&1 &
+echo $! > /tmp/goexchange-api.pid
+nohup ./bin/scheduler > /tmp/goexchange-scheduler.log 2>&1 &
+echo $! > /tmp/goexchange-scheduler.pid
+
+# Wait for API port
+for i in $(seq 1 20); do
+    if ss -tln 2>/dev/null | grep -q ":$API_PORT "; then
+        ok "API listening on :$API_PORT after ${i}s (pid $(cat /tmp/goexchange-api.pid))"
+        break
+    fi
+    sleep 1
+    [ "$i" = "20" ] && err "API did not bind :$API_PORT in 20s; see /tmp/goexchange-api.log"
 done
 
-# Check API
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8099/api/v1/markets 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" = "200" ]; then
-    ok "API responding (200)"
+# Scheduler health
+sleep 2
+if ss -tln 2>/dev/null | grep -q ":$SCHEDULER_PORT "; then
+    ok "scheduler listening on :$SCHEDULER_PORT (pid $(cat /tmp/goexchange-scheduler.pid))"
 else
-    warn "API HTTP $HTTP_CODE"
-fi
-
-# Check web
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost 2>/dev/null || echo "000")
-[ "$HTTP_CODE" = "301" ] && HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://localhost 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" = "200" ]; then
-    ok "Web responding (200)"
-else
-    warn "Web HTTP $HTTP_CODE"
+    warn "scheduler not listening on :$SCHEDULER_PORT yet; tail /tmp/goexchange-scheduler.log"
 fi
 
 # ============================================================================
-# Summary
+# Step 7: smoke test
 # ============================================================================
-ok "================================================="
-ok "  DEPLOYMENT COMPLETE"
-ok "================================================="
-echo ""
-echo "📊 Database state:"
-docker exec ${DB_CONTAINER} psql -U ${DB_USER} -d ${DB_NAME} -c "
-    SELECT
-        (SELECT COUNT(*) FROM users)        AS users,
-        (SELECT COUNT(*) FROM trading_pairs) AS pairs,
-        (SELECT COUNT(*) FROM orders)        AS orders,
-        (SELECT COUNT(*) FROM balances)      AS balances
-" 2>/dev/null
+log "=== Step 7: smoke test ==="
 
+# Markets list
+MARKETS=$(curl -sS --max-time 5 "http://127.0.0.1:$API_PORT/api/v1/markets?enabled_only=true")
+PAIR_COUNT=$(echo "$MARKETS" | grep -oE '"pair":"[A-Z]+_[A-Z]+"' | wc -l)
+[ "$PAIR_COUNT" -ge 1 ] && ok "markets API returned $PAIR_COUNT pairs" \
+                       || warn "markets API returned no pairs (got: $MARKETS)"
+
+# Postgres write probe
+PG_ROW=$(PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p "$DB_HOST_PORT" -U "$DB_USER" -d "$DB_NAME" \
+          -tAc "SELECT count(*) FROM trading_pairs;" 2>/dev/null)
+[ -n "$PG_ROW" ] && [ "$PG_ROW" -ge 1 ] && ok "DB trading_pairs has $PG_ROW rows" \
+                                    || err "DB trading_pairs empty"
+
+# Matching gRPC reachability (gRPC client health check via the API):
+# we hit /api/v1/markets/BTC/USDT/orderbook which round-trips through matching.
+ORDERBOOK=$(curl -sS --max-time 5 "http://127.0.0.1:$API_PORT/api/v1/markets/BTC/USDT/orderbook")
+echo "$ORDERBOOK" | grep -q '"pair":"BTC_USDT"' \
+    && ok "matching gRPC reachable (orderbook JSON returned)" \
+    || warn "matching orderbook probe failed (got: $ORDERBOOK)"
+
+# ============================================================================
+# Done
+# ============================================================================
 echo ""
-echo "🌐 Access URLs:"
-echo "   Frontend: https://${DOMAIN}"
-echo "   API:      https://${DOMAIN}/api/v1/markets"
+log "=== deploy complete ==="
 echo ""
-echo "📝 Next: Register a new admin user:"
-echo "   curl -X POST http://localhost:8099/api/v1/users/register \\"
-echo "        -H 'Content-Type: application/json' \\"
-echo "        -d '{\"email\":\"you@example.com\",\"password\":\"YourPass123!\",\"role\":\"admin\"}'"
+echo "  Public API:    http://127.0.0.1:$API_PORT"
+echo "  Scheduler:     http://127.0.0.1:$SCHEDULER_PORT/health"
+echo "  Matching gRPC: :$MATCHING_HOST_PORT  (docker container $MATCHING_CONTAINER)"
+echo "  Postgres:      127.0.0.1:$DB_HOST_PORT  (container $DB_CONTAINER)"
 echo ""
-ok "Done!"
+echo "  API log:       tail -f /tmp/goexchange-api.log"
+echo "  Sched log:     tail -f /tmp/goexchange-scheduler.log"
+echo "  Match log:     docker logs -f $MATCHING_CONTAINER"
+echo ""
+echo "  PIDs:          API=\$(cat /tmp/goexchange-api.pid)  Sched=\$(cat /tmp/goexchange-scheduler.pid)"
+echo ""
+ok "all up. To register a user: curl -X POST http://127.0.0.1:$API_PORT/api/v1/users/register -d '{\"email\":\"a@b.c\",\"password\":\"Test123!\"}'"
