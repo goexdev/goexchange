@@ -155,6 +155,11 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/users/me/triggers", createTriggerOrderHandler(d))
 		r.Delete("/users/me/triggers/{id}", cancelTriggerOrderHandler(d))
 		r.Get("/users/me/kyc", listKYCHandler(d))
+		// Authenticated KYC image download — replaces the old anonymous
+		// /kyc/<hash>.png static serve that let any unauthenticated
+		// visitor read a user's ID document if they had the URL
+		// (NEW-H1 from the 2026-08-28 v0.3 audit).
+		r.Get("/users/me/kyc/files/{file}", kycUserFileHandler(d))
 		r.Get("/users/me/limit", getKycLimitHandler(d))
 		r.Get("/users/me/trades", userTradesHandler(d))
 		r.Get("/users/me/api-keys", userAPIKeysHandler(d))

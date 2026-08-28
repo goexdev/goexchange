@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +65,16 @@ func New(baseDir string) (*Store, error) {
 }
 
 // Save stores data under category with a random filename.
-// Returns the relative path (e.g. "kyc/abc123.jpg") and MIME type.
+//
+// The declared Content-Type is checked against the per-category allow
+// list AND the actual file contents (via net/http's content-type
+// sniffer on the first 512 bytes). A client can lie about the
+// multipart Content-Type — they cannot easily fake PNG / JPEG magic
+// bytes. The combination of declared + sniffed type closes the bypass
+// flagged in the 2026-08-28 v0.3 audit (NEW-H1).
+//
+// Returns the relative path (e.g. "kyc/abc123.jpg") and the *sniffed*
+// MIME type (not the client-declared one).
 func (s *Store) Save(category string, contentType string, data io.Reader) (string, string, error) {
 	if !isValidCategory(category) {
 		return "", "", fmt.Errorf("invalid category: %s", category)
@@ -77,6 +87,18 @@ func (s *Store) Save(category string, contentType string, data io.Reader) (strin
 
 	if !contains(allowed, contentType) {
 		return "", "", fmt.Errorf("content type %q not allowed for category %q", contentType, category)
+	}
+
+	// Sniff the actual file magic bytes from the first 512 bytes and
+	// require the declared type to match the sniffed type. This is the
+	// real defence against arbitrary-file uploads; the declared
+	// Content-Type alone is attacker-controlled.
+	sniffed, sniffedSize, err := sniffReader(data)
+	if err != nil {
+		return "", "", fmt.Errorf("read for sniffing: %w", err)
+	}
+	if sniffed != contentType {
+		return "", "", fmt.Errorf("file content does not match declared content type: declared %q, sniffed %s", contentType, sniffed)
 	}
 
 	ext, err := extensionForContentType(contentType)
@@ -97,19 +119,35 @@ func (s *Store) Save(category string, contentType string, data io.Reader) (strin
 	}
 	defer f.Close()
 
+	// We already consumed up to 512 bytes above; tee the remaining
+	// bytes into the file without buffering more than MaxFileSize.
 	limited := io.LimitReader(data, MaxFileSize+1)
 	written, err := io.Copy(f, limited)
 	if err != nil {
 		_ = os.Remove(path)
 		return "", "", fmt.Errorf("write file: %w", err)
 	}
-	if written > MaxFileSize {
+	if int(written)+sniffedSize > MaxFileSize { // includes the 512 bytes we already read for sniffing
 		_ = os.Remove(path)
 		return "", "", fmt.Errorf("file too large: max %d bytes", MaxFileSize)
 	}
 
 	rel := filepath.ToSlash(filepath.Join(category, filename))
 	return rel, contentType, nil
+}
+
+// sniffReader reads up to 512 bytes from r, returns the net/http
+// detected content type, and pushes the read bytes back so the caller
+// can continue streaming. If no match, returns application/octet-stream.
+func sniffReader(r io.Reader) (string, int, error) {
+	const sniffLen = 512
+	var buf [sniffLen]byte
+	n, err := io.ReadFull(r, buf[:])
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return "", 0, err
+	}
+	ct := http.DetectContentType(buf[:n])
+	return ct, n, nil
 }
 
 // Path returns the absolute filesystem path for a relative path.
