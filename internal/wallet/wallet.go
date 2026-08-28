@@ -15,7 +15,7 @@ import (
 
 // Balance represents a user's balance for one asset.
 type Balance struct {
-	UserID    uuid.UUID       `json:"user_id"`
+	UserID    uuid.UUID       `json:"-"`         // omitted from JSON — leaks account id (M9 from the 2026-08-28 audit)
 	Asset     string          `json:"asset"`
 	Available decimal.Decimal `json:"available"`
 	Frozen    decimal.Decimal `json:"frozen"`

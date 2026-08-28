@@ -1412,7 +1412,7 @@ func (s *Service) cancelWithRetry(ctx context.Context, pair string, orderID, use
 // OrderRecord is the DB representation of an order.
 type OrderRecord struct {
 	ID             uuid.UUID       `json:"id"`
-	UserID         uuid.UUID       `json:"user_id"`
+	UserID         uuid.UUID       `json:"-"` // omitted — leaks account id (M10 from the 2026-08-28 audit); callers must authenticate and trust their own context
 	PairID         int             `json:"pair_id"`
 	Pair           string          `json:"pair"` // base_quote, e.g. "BTC_USDT"
 	Base           string          `json:"base"`

@@ -49,11 +49,14 @@ func placeOrderHandler(d Deps) http.HandlerFunc {
 		}
 
 
-		// SECURITY: Validate side
-		if in.Side != "BUY" && in.Side != "SELL" {
-			writeError(w, http.StatusBadRequest, "side must be BUY or SELL")
-			return
-		}
+		// SECURITY: Validate side. Accept mixed case so the UI's natural
+		// "Buy"/"Sell" labels don't trigger 400s (M7 from the 2026-08-28 audit).
+		// We normalise to uppercase before downstream use.
+		in.Side = strings.ToUpper(in.Side)
+			if in.Side != "BUY" && in.Side != "SELL" {
+				writeError(w, http.StatusBadRequest, "side must be BUY or SELL")
+				return
+			}
 
 		// Determine order type
 		orderType := trading.OrderTypeLimit

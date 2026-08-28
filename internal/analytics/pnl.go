@@ -11,30 +11,36 @@ import (
 )
 
 // PairPnL is the aggregate P&L for one trading pair.
+//
+// Numeric amounts are returned as JSON numbers (not strings) so that
+// the SPA can sum / chart / i18n-format them without a parse round-trip
+// (M11 from the 2026-08-28 audit). Precision is bounded by the
+// upstream `%.8f` formatting — the API does not preserve fractional
+// satoshi precision beyond 8 decimal places.
 type PairPnL struct {
-	Pair            string `json:"pair"`
-	RealizedPnL     string `json:"realized_pnl"`
-	UnrealizedPnL   string `json:"unrealized_pnl"`
-	TotalPnL        string `json:"total_pnl"`
-	TotalBought     string `json:"total_bought"`
-	TotalSold       string `json:"total_sold"`
-	CurrentHoldings string `json:"current_holdings"`
-	AvgBuyPrice     string `json:"avg_buy_price"`
-	AvgSellPrice    string `json:"avg_sell_price"`
-	TotalVolume     string `json:"total_volume"`
-	TotalTrades     int    `json:"total_trades"`
+	Pair            string  `json:"pair"`
+	RealizedPnL     float64 `json:"realized_pnl"`
+	UnrealizedPnL   float64 `json:"unrealized_pnl"`
+	TotalPnL        float64 `json:"total_pnl"`
+	TotalBought     float64 `json:"total_bought"`
+	TotalSold       float64 `json:"total_sold"`
+	CurrentHoldings float64 `json:"current_holdings"`
+	AvgBuyPrice     float64 `json:"avg_buy_price"`
+	AvgSellPrice    float64 `json:"avg_sell_price"`
+	TotalVolume     float64 `json:"total_volume"`
+	TotalTrades     int     `json:"total_trades"`
 }
 
 // UserPnL is the full P&L summary for a user.
 type UserPnL struct {
-	UserID          uuid.UUID  `json:"user_id"`
+	UserID          uuid.UUID  `json:"-"` // omitted — leaks account id (M10 from the 2026-08-28 audit)
 	GeneratedAt     time.Time  `json:"generated_at"`
 	Pairs           []PairPnL  `json:"pairs"`
-	TotalPnL        string     `json:"total_pnl"`
-	TotalRealized   string     `json:"total_realized"`
-	TotalUnrealized string     `json:"total_unrealized"`
+	TotalPnL        float64    `json:"total_pnl"`
+	TotalRealized   float64    `json:"total_realized"`
+	TotalUnrealized float64    `json:"total_unrealized"`
 	TotalTrades     int        `json:"total_trades"`
-	TotalVolume     string     `json:"total_volume"`
+	TotalVolume     float64    `json:"total_volume"`
 }
 
 // StatusInfo represents platform health.
@@ -185,27 +191,27 @@ func (s *Service) ComputeUserPnL(ctx context.Context, userID uuid.UUID) (*UserPn
 			holdings += parseFloat(buy.quantity)
 		}
 		result.Pairs = append(result.Pairs, PairPnL{
-			Pair:            pair,
-			RealizedPnL:     fmt.Sprintf("%.8f", ps.realizedPnL),
-			UnrealizedPnL:   "0.00000000",
-			TotalPnL:        fmt.Sprintf("%.8f", ps.realizedPnL),
-			TotalBought:     fmt.Sprintf("%.8f", ps.totalBought),
-			TotalSold:       fmt.Sprintf("%.8f", ps.totalSold),
-			CurrentHoldings: fmt.Sprintf("%.8f", holdings),
-			AvgBuyPrice:     fmt.Sprintf("%.8f", avgBuy),
-			AvgSellPrice:    fmt.Sprintf("%.8f", avgSell),
-			TotalVolume:     fmt.Sprintf("%.8f", ps.totalVolume),
-			TotalTrades:     ps.tradeCount,
-		})
+		Pair:            pair,
+		RealizedPnL:     round8(ps.realizedPnL),
+		UnrealizedPnL:   0,
+		TotalPnL:        round8(ps.realizedPnL),
+		TotalBought:     round8(ps.totalBought),
+		TotalSold:       round8(ps.totalSold),
+		CurrentHoldings: round8(holdings),
+		AvgBuyPrice:     round8(avgBuy),
+		AvgSellPrice:    round8(avgSell),
+		TotalVolume:     round8(ps.totalVolume),
+		TotalTrades:     ps.tradeCount,
+	})
 		totalRealized += ps.realizedPnL
 		totalTrades += ps.tradeCount
 		totalVolume += ps.totalVolume
 	}
-	result.TotalRealized = fmt.Sprintf("%.8f", totalRealized)
-	result.TotalUnrealized = "0.00000000"
-	result.TotalPnL = result.TotalRealized
+	result.TotalRealized = round8(totalRealized)
+	result.TotalUnrealized = 0
+	result.TotalPnL = round8(totalRealized)
 	result.TotalTrades = totalTrades
-	result.TotalVolume = fmt.Sprintf("%.8f", totalVolume)
+	result.TotalVolume = round8(totalVolume)
 
 	return result, nil
 }
@@ -244,4 +250,13 @@ func (s *Service) ComputeStatus(ctx context.Context) *StatusInfo {
 		UptimeSeconds: int64(time.Since(startTime).Seconds()),
 		Components:    components,
 	}
+}
+// round8 rounds a float64 to 8 decimal places — same precision as the
+// previous %.8f string formatting, but returning a float so the JSON
+// encoder emits a number instead of a quoted string (M11 fix).
+func round8(v float64) float64 {
+	if v >= 0 {
+		return float64(int64(v*1e8+0.5)) / 1e8
+	}
+	return float64(int64(v*1e8-0.5)) / 1e8
 }
