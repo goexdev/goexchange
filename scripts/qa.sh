@@ -79,10 +79,10 @@ send_telegram_notification() {
 }
 
 # 1. Health check
-run_check "Service health check" "curl -k -s https://pow.credit/healthz | grep -q ok"
+run_check "Service health check" "curl -k -s https://goexchange.top/healthz | grep -q ok"
 
 # 2. Public status endpoint
-run_check "Public status endpoint" "curl -k -s https://pow.credit/api/v1/status | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d[\"status\"] in [\"operational\", \"degraded\"]'"
+run_check "Public status endpoint" "curl -k -s https://goexchange.top/api/v1/status | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d[\"status\"] in [\"operational\", \"degraded\"]'"
 
 # 3. Backend Go tests
 print_header "Backend Go tests"
@@ -149,7 +149,7 @@ fi
 print_header "API endpoints"
 endpoints=("/api/v1/markets" "/api/v1/markets/BTC/USDT/orderbook" "/api/v1/markets/BTC/USDT/ticker")
 for ep in "${endpoints[@]}"; do
-    code=$(curl -k -s -o /dev/null -w "%{http_code}" "https://pow.credit$ep")
+    code=$(curl -k -s -o /dev/null -w "%{http_code}" "https://goexchange.top$ep")
     if [ "$code" = "200" ]; then
         echo -e "  ${GREEN}OK${NC} $ep"
     else

@@ -40,10 +40,10 @@ if ! docker ps --format "{{.Names}}" | grep -q "^goexchange-grafana$"; then
     -v "$REPO_ROOT/deploy/monitoring/grafana/grafana.ini:/etc/grafana/grafana.ini:ro" \
     -e GF_SECURITY_ADMIN_PASSWORD=admin123 \
     -e GF_USERS_ALLOW_SIGN_UP=false \
-    -e GF_SERVER_ROOT_URL=https://pow.credit/grafana/ \
+    -e GF_SERVER_ROOT_URL=https://goexchange.top/grafana/ \
     grafana/grafana:latest
   echo "  Started (http://localhost:3002 - host network)"
-  echo "  Remote access: https://pow.credit/grafana/"
+  echo "  Remote access: https://goexchange.top/grafana/"
   echo "  Default login: admin / admin123"
 else
   echo "Grafana already running"

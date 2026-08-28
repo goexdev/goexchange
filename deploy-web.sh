@@ -28,11 +28,11 @@ ls -la $ASSETS_DIR/
 # Test
 echo
 echo "=== HTTP status ==="
-HTML_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" https://pow.credit/)
+HTML_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" https://goexchange.top/)
 echo "HTML: $HTML_STATUS"
 for f in $ASSETS_DIR/*; do
     NAME=$(basename $f)
-    STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://pow.credit/assets/$NAME")
+    STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://goexchange.top/assets/$NAME")
     echo "$NAME: $STATUS"
 done
 

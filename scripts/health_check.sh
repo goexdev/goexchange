@@ -91,8 +91,8 @@ check "API healthz 200" "curl -s -o /dev/null -w '%{http_code}' http://localhost
 check "API markets endpoint 200" "curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8099/api/v1/markets?enabled_only=true' | grep -q 200"
 
 # Check HTTPS
-check "HTTPS pow.credit 200" "curl -k -s -o /dev/null -w '%{http_code}' https://pow.credit/healthz | grep -q 200"
-check "HTTPS markets endpoint 200" "curl -k -s -o /dev/null -w '%{http_code}' 'https://pow.credit/api/v1/markets?enabled_only=true' | grep -q 200"
+check "HTTPS goexchange.top 200" "curl -k -s -o /dev/null -w '%{http_code}' https://goexchange.top/healthz | grep -q 200"
+check "HTTPS markets endpoint 200" "curl -k -s -o /dev/null -w '%{http_code}' 'https://goexchange.top/api/v1/markets?enabled_only=true' | grep -q 200"
 
 if ! $JSON; then
   echo

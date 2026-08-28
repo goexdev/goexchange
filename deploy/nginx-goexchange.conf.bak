@@ -9,7 +9,7 @@
 server {
     listen 80;
     listen [::]:80;
-    server_name pow.credit www.pow.credit;
+    server_name goexchange.top www.goexchange.top;
 
     # ACME challenge for Let's Encrypt (renewal)
     location /.well-known/acme-challenge/ {
@@ -32,11 +32,11 @@ map $http_upgrade $connection_upgrade {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name pow.credit www.pow.credit;
+    server_name goexchange.top www.goexchange.top;
 
     # SSL certificates (Let's Encrypt)
-    ssl_certificate /etc/letsencrypt/live/pow.credit/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/pow.credit/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/goexchange.top/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/goexchange.top/privkey.pem;
 
     # SSL config (Mozilla Intermediate)
     ssl_protocols TLSv1.2 TLSv1.3;

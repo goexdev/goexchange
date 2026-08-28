@@ -22,7 +22,7 @@ from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 # Config
 API_BASE = os.getenv("API_BASE", "http://localhost:8099/api/v1")
 HEALTH_URL = os.getenv("HEALTH_URL", "http://localhost:8099/healthz")
-WEB_BASE = os.getenv("WEB_BASE", "https://pow.credit")
+WEB_BASE = os.getenv("WEB_BASE", "https://goexchange.top")
 TEST_USER_EMAIL = "uitest@goexchange.local"
 TEST_USER_PASSWORD = "uitest123!"
 
