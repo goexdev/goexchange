@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/goexdev/goexchange/internal/audit"
 
@@ -18,6 +20,76 @@ import (
 	"github.com/goexdev/goexchange/internal/matching"
 	"github.com/goexdev/goexchange/internal/trading"
 )
+
+// orderRateLimiter is an in-memory per-user token bucket that prevents
+// a single user from spamming the matching engine. The previous
+// deployment accepted thousands of orders from one account and had no
+// upper bound — see NEW-M5 in the 2026-08-28 v0.3 audit.
+//
+// The map is keyed by userID. Entries auto-expire after the refill
+// window so the map stays bounded in size under churn.
+//
+// We use a simple sliding-window count: each call trims timestamps
+// older than `window` and rejects if `len(timestamps) >= limit`.
+//
+// Switching to Redis later is a one-function change (see
+// placeOrderHandler).
+type orderRateLimiter struct {
+	mu       sync.Mutex
+	hits     map[string][]time.Time
+	limit    int
+	window   time.Duration
+}
+
+var orderPlaceLimiter = &orderRateLimiter{
+	hits:   make(map[string][]time.Time),
+	limit:  20,             // 20 orders per minute per user
+	window: time.Minute,
+}
+
+func (l *orderRateLimiter) allow(userID string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-l.window)
+	hits := l.hits[userID]
+	// drop expired
+	i := 0
+	for i < len(hits) && hits[i].Before(cutoff) {
+		i++
+	}
+	hits = hits[i:]
+	if len(hits) >= l.limit {
+		// retry-after = (oldest in-window) + window - now
+		retry := hits[0].Add(l.window).Sub(now)
+		if retry < time.Second {
+			retry = time.Second
+		}
+		l.hits[userID] = hits
+		return false, retry
+	}
+	hits = append(hits, now)
+	l.hits[userID] = hits
+	return true, 0
+}
+
+// periodicLimiterGC sweeps the limiter map periodically to drop
+// idle entries.
+func init() {
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			orderPlaceLimiter.mu.Lock()
+			for k, v := range orderPlaceLimiter.hits {
+				if len(v) == 0 {
+					delete(orderPlaceLimiter.hits, k)
+				}
+			}
+			orderPlaceLimiter.mu.Unlock()
+		}
+	}()
+}
 
 // placeOrderHandler handles POST /api/v1/orders (authenticated).
 //
@@ -32,6 +104,15 @@ func placeOrderHandler(d Deps) http.HandlerFunc {
 		uid, err := uuid.Parse(userID)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid user id")
+			return
+		}
+
+		// NEW-M5: per-user rate limit on order placement. 20 orders/min
+		// is enough for a power-trader and stops a malicious client from
+		// loading thousands of OPEN orders into the matching engine.
+		if ok, retryAfter := orderPlaceLimiter.allow(userID); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			writeError(w, http.StatusTooManyRequests, "order rate limit exceeded; retry shortly")
 			return
 		}
 
