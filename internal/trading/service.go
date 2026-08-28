@@ -1247,7 +1247,7 @@ type AmendOrderInput struct {
 // race conditions where two concurrent cancels could double-unfreeze.
 // Re-verifies order status inside the transaction to ensure idempotency:
 // a cancel of an already-cancelled order returns nil (already closed).
-func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID uuid.UUID) error {
+func (s *Service) CancelOrder(ctx context.Context, orderID, userID uuid.UUID) error {
 	// Begin transaction
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1357,6 +1357,12 @@ func (s *Service) CancelOrder(ctx context.Context, pair string, orderID, userID 
 	// backoff so transient gRPC errors do not leave the engine out of sync.
 	// The DB is already CANCELLED; retrying cannot make the situation worse,
 	// but failing to notify can leave the cache stale.
+	// Build the matching-engine pair key (BASE_QUOTE) from the values
+	// already loaded by the FOR UPDATE query above — avoids the caller
+	// having to know it (H4 from the 2026-08-28 audit: cancel orders
+	// should be addressable by order ID alone).
+	pair := base + "_" + quote
+
 	if s.src != nil {
 		if err := s.cancelWithRetry(ctx, pair, orderID, userID); err != nil {
 			// Log at WARN, not silently swallowed. The DB is correct; the

@@ -219,7 +219,13 @@ func auditCancelAll(d Deps, r *http.Request, userID uuid.UUID, pair string, canc
 
 // cancelOrderHandler handles DELETE /api/v1/orders/{id} (authenticated).
 //
-// Path: /api/v1/orders/{id}?pair=BTC_USDT
+// Path: /api/v1/orders/{id}
+//
+// The pair is *not* a required query param — the service derives it from
+// the order row itself (H4 from the 2026-08-28 audit). We keep the
+// query param as an optional override for legacy clients; if it does
+// match the order's actual pair we ignore it (logging at WARN) so a
+// stale value can't misroute the cancel.
 func cancelOrderHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := userIDFromContext(r.Context())
@@ -240,16 +246,14 @@ func cancelOrderHandler(d Deps) http.HandlerFunc {
 			return
 		}
 
-		pair := r.URL.Query().Get("pair")
-		if pair == "" {
-			writeError(w, http.StatusBadRequest, "missing pair query param")
-			return
-		}
+		// `pair` query param is accepted for backwards compatibility but
+		// no longer required. If supplied, we keep it for the audit log.
+		pairHint := r.URL.Query().Get("pair")
 
-		err = d.TradingSvc.CancelOrder(r.Context(), pair, orderID, uid)
+		err = d.TradingSvc.CancelOrder(r.Context(), orderID, uid)
 		if err != nil {
 			// SECURITY: Audit log all cancel attempts (success and failure)
-			auditCancel(d, r, uid, &orderID, pair, false, err)
+			auditCancel(d, r, uid, &orderID, pairHint, false, err)
 			switch {
 			case errors.Is(err, trading.ErrOrderNotFound):
 				writeError(w, http.StatusNotFound, "order not found")
@@ -265,7 +269,7 @@ func cancelOrderHandler(d Deps) http.HandlerFunc {
 		}
 
 		// SECURITY: Audit log successful cancel
-		auditCancel(d, r, uid, &orderID, pair, true, nil)
+		auditCancel(d, r, uid, &orderID, pairHint, true, nil)
 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "order_id": orderID.String()})
 	}
