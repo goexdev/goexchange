@@ -119,14 +119,24 @@ func (m *Migrator) Run(ctx context.Context, fs embed.FS, dir string) error {
 			return fmt.Errorf("mark dirty %d: %w", mig.version, err)
 		}
 
-		// Run in transaction
+		// Run in transaction. pgx's tx.Exec executes a single statement at
+		// a time; for migration files that contain several CREATE TABLE /
+		// INSERT / ALTER statements separated by `;`, we split on `;` and
+		// execute each statement individually. (The earlier single-Exec
+		// path broke on scheduler/migrations/0001_init.up.sql where the
+		// currencies INSERT used to omit its trailing `;` in an attempt
+		// to make pgx treat the whole file as one statement — pgx never
+		// did, so the migrate step crashed with a syntax error. Bug #3.)
 		tx, err := m.pool.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("begin tx: %w", err)
 		}
-		if _, err := tx.Exec(ctx, mig.sql); err != nil {
-			_ = tx.Rollback(ctx)
-			return fmt.Errorf("exec migration %d: %w", mig.version, err)
+		stmts := splitSQLStatements(mig.sql)
+		for _, stmt := range stmts {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				_ = tx.Rollback(ctx)
+				return fmt.Errorf("exec migration %d statement %q: %w", mig.version, stmt, err)
+			}
 		}
 		// Mark as clean
 		if _, err := tx.Exec(ctx,
@@ -151,3 +161,36 @@ func (m *Migrator) Run(ctx context.Context, fs embed.FS, dir string) error {
 
 // ErrNoMigrations signals no migrations to apply.
 var ErrNoMigrations = errors.New("no migrations to apply")
+
+// splitSQLStatements splits a SQL script into individual statements.
+// Statements end at a top-level `;`. We intentionally do not try to
+// parse string literals or dollar-quoted bodies — migration files in
+// this repo do not contain them, and keeping the splitter simple
+// keeps the failure mode obvious when a file does.
+//
+// We strip `-- line comments` so a comment that contains a `;` does
+// not accidentally split a statement. Multi-line `/* ... */` block
+// comments are not stripped; if a future migration needs them we can
+// extend this helper.
+func splitSQLStatements(sql string) []string {
+	// Drop line comments first so their embedded `;` is ignored.
+	var cleaned strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		cleaned.WriteString(line)
+		cleaned.WriteByte('\n')
+	}
+	parts := strings.Split(cleaned.String(), ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
