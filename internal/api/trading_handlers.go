@@ -273,7 +273,13 @@ func cancelOrderHandler(d Deps) http.HandlerFunc {
 
 // listOrdersHandler handles GET /api/v1/orders (authenticated).
 //
-// Returns the user's recent orders (max 50).
+// Returns the user's recent orders (max 50). The response carries two
+// counters so the SPA can show "your active orders" without a second
+// round-trip (M6 from the 2026-08-28 audit):
+//   count   — number of orders in the returned list
+//   active  — number of those still OPEN or PARTIAL
+//
+// Both `pair` and `status` query params are supported.
 func listOrdersHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := userIDFromContext(r.Context())
@@ -299,9 +305,16 @@ func listOrdersHandler(d Deps) http.HandlerFunc {
 		if orders == nil {
 			orders = []*trading.OrderRecord{}
 		}
+		active := 0
+		for _, o := range orders {
+			if o.Status == matching.StatusOpen || o.Status == matching.StatusPartial {
+				active++
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"orders": orders,
-			"count": len(orders),
+			"count":  len(orders),
+			"active": active,
 		})
 	}
 }
