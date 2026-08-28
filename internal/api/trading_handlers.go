@@ -264,7 +264,7 @@ func cancelOrderHandler(d Deps) http.HandlerFunc {
 		// SECURITY: Audit log successful cancel
 		auditCancel(d, r, uid, &orderID, pair, true, nil)
 
-		writeJSON(w, http.StatusOK, map[string]string{"status": "canceled", "order_id": orderID.String()})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "order_id": orderID.String()})
 	}
 }
 

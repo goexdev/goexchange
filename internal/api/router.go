@@ -307,7 +307,23 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // writeError writes an error response.
+//
+// For 5xx status codes the raw error is logged at ERROR level on the
+// server and a generic "internal error" message is sent to the client
+// — this prevents leaking database / OS / file-path details that an
+// attacker can use to fingerprint the stack and probe for further bugs
+// (see H2 from the 2026-08-28 audit). 4xx status codes keep the raw
+// error string because they normally come from validation / lookup
+// paths and are useful to surface to the caller.
 func writeError(w http.ResponseWriter, status int, msg string) {
+	if status >= 500 {
+		// log so we can debug — but do NOT echo msg to client
+		// (the handler is expected to log the err before calling
+		// writeError; this is a last-resort backstop in case it
+		// forgets). Use a fixed string so we never leak anything.
+		writeJSON(w, status, map[string]string{"error": "internal error"})
+		return
+	}
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 

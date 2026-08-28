@@ -113,6 +113,7 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+
 func loginHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
@@ -120,7 +121,7 @@ func loginHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-	ip := stripPort(r.RemoteAddr)
+		ip := stripPort(r.RemoteAddr)
 		ua := r.UserAgent()
 
 		// Check lockout
@@ -177,9 +178,9 @@ func loginHandler(d Deps) http.HandlerFunc {
 			TargetLabel: u.Email,
 		})
 
-		// Compute risk score
+		// Compute risk score (internal use only — never expose to client)
 		score, _ := d.RiskSvc.ComputeLoginScore(r.Context(), u.ID, req.Email, ip)
-	_ = d.UserSvc.ClearLoginAttempts(r.Context(), req.Email)
+		_ = d.UserSvc.ClearLoginAttempts(r.Context(), req.Email)
 		if score != nil {
 			_ = d.RiskSvc.UpdateUserRiskScore(r.Context(), u.ID, score.Score)
 			_ = d.RiskSvc.RecordEvent(r.Context(), u.ID, "LOGIN", score, map[string]interface{}{
@@ -208,15 +209,13 @@ func loginHandler(d Deps) http.HandlerFunc {
 				TargetID:    &u.ID,
 				TargetLabel: u.Email,
 			})
+			// risk_score / risk_factors intentionally NOT in the response —
+			// exposing them lets an attacker tune behaviour to slip past
+			// the controls (H3 from the 2026-08-28 audit).
 			resp := map[string]interface{}{
 				"requires_2fa": true,
 				"temp_token":   tempToken,
-				"user":         u.ToPublic(), // show user info but no full token
-			}
-			if score != nil {
-				resp["risk_score"] = score.Score
-				resp["risk_action"] = score.Action
-				resp["risk_factors"] = score.Factors
+				"user":         u.ToPublic(),
 			}
 			writeJSON(w, http.StatusOK, resp)
 			return
@@ -232,23 +231,21 @@ func loginHandler(d Deps) http.HandlerFunc {
 			"user":  u.ToPublic(),
 			"token": token,
 		}
-		if score != nil {
-			resp["risk_score"] = score.Score
-			resp["risk_action"] = score.Action
-			resp["risk_factors"] = score.Factors
 
-			// Trigger: risky login notification (high risk)
-			if score.Score >= 20 {
-				go func(uid uuid.UUID, sc int, factors map[string]int) {
-					bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer bgCancel()
-					d.Notifier.SendNotification(bgCtx, uid, notifier.TypeLoginRisk,
-						"Unusual Login Activity",
-						fmt.Sprintf("We detected a login with elevated risk (score: %d). If this wasn't you, please change your password.", sc),
-						map[string]any{"risk_score": sc, "factors": factors})
-				}(u.ID, score.Score, score.Factors)
-			}
+		// Trigger: risky login notification (high risk).
+		// risk_score / factors are intentionally NOT exposed to the client —
+		// the score is still used here for the in-app + email notification.
+		if score != nil && score.Score >= 20 {
+			go func(uid uuid.UUID, sc int, factors map[string]int) {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer bgCancel()
+				d.Notifier.SendNotification(bgCtx, uid, notifier.TypeLoginRisk,
+					"Unusual Login Activity",
+					fmt.Sprintf("We detected a login with elevated risk (score: %d). If this wasn't you, please change your password.", sc),
+					map[string]any{"risk_score": sc, "factors": factors})
+			}(u.ID, score.Score, score.Factors)
 		}
+
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
