@@ -12,7 +12,7 @@ import (
 
 // Prefs represents a user's notification preferences.
 type Prefs struct {
-	UserID                uuid.UUID `json:"user_id"`
+	UserID                uuid.UUID `json:"-"` // omitted — leaks account id (NEW-M4 from the 2026-08-28 v0.3 audit)
 	Notify2FAEnabled      bool      `json:"notify_2fa_enabled"`
 	Notify2FADisabled     bool      `json:"notify_2fa_disabled"`
 	Notify2FABackupUsed   bool      `json:"notify_2fa_backup_used"`

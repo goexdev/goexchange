@@ -25,12 +25,17 @@ func (r *Repo) Create(ctx context.Context, u *User) error {
 	// Force L0 (default, no KYC) for new users
 	u.KycLevel = 0
 	u.KycStatus = "NONE"
+	// NEW-M3: persist Role so the public user payload always has a
+	// non-empty value; default to "user" if the caller didn't set one.
+	if u.Role == "" {
+		u.Role = "user"
+	}
 	const q = `
-		INSERT INTO users (id, email, password_hash, kyc_level, kyc_status)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (id, email, password_hash, kyc_level, kyc_status, role)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING created_at, updated_at
 	`
-	err := r.pool.QueryRow(ctx, q, u.ID, u.Email, u.PasswordHash, u.KycLevel, u.KycStatus).Scan(
+	err := r.pool.QueryRow(ctx, q, u.ID, u.Email, u.PasswordHash, u.KycLevel, u.KycStatus, u.Role).Scan(
 		&u.CreatedAt, &u.UpdatedAt,
 	)
 	if err != nil {

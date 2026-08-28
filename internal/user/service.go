@@ -57,6 +57,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (*User, error)
 		PasswordHash: string(hash),
 		KycLevel:     0, // L0 = default, no KYC required
 		KycStatus:    "NONE",
+		Role:         "user", // NEW-M3: explicit default so downstream auth/UI never sees an empty role
 	}
 
 	if err := s.repo.Create(ctx, u); err != nil {
