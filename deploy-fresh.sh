@@ -242,7 +242,23 @@ ok "database $DB_NAME (re)created empty"
 
 # Apply all migrations from scratch on the empty database.
 migrate -path migrations -database "$MIGRATE_URL" up
-ok "migrations applied"
+ok "migrations applied (public repo)"
+
+# The scheduler binary carries its own embedded migrations under
+# cmd/scheduler/migrations/ — the same schema as the public repo, just
+# a subset. After the public migrations ran, every CREATE TABLE the
+# scheduler would try to apply already exists, so without this hint
+# the scheduler's embedded migrator dies on 'relation already exists'.
+# We pre-mark every scheduler migration as already applied so its
+# idempotency check skips them on a fresh deploy.
+SCHED_VERSIONS=$(ls "$PUBLIC_DIR/cmd/scheduler/migrations/"*.up.sql 2>/dev/null \
+    | sed 's|.*/||' | grep -oE '^[0-9]+' | sort -n | uniq)
+for v in $SCHED_VERSIONS; do
+    PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p "$DB_HOST_PORT" -U "$DB_USER" -d "$DB_NAME" \
+        -c "INSERT INTO schema_migrations (version, dirty) VALUES ($v, false) \
+            ON CONFLICT (version) DO UPDATE SET dirty = false;" >/dev/null 2>&1 || true
+done
+ok "scheduler migration set pre-marked as already applied"
 
 # ============================================================================
 # Step 5: build API + scheduler
