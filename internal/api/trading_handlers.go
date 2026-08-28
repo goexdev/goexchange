@@ -783,3 +783,41 @@ func adminListPairsHandler(d Deps) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, pairs)
 	}
 }
+
+// getOrderHandler handles GET /api/v1/orders/{id} (authenticated).
+//
+// Returns one order owned by the authenticated user. The id must be a
+// valid UUID; non-owned orders return 404 (not 403) so the SPA can't
+// probe whether an order id exists — defence in depth on top of the
+// auth check (NEW-L4 from the 2026-08-28 v0.3 audit).
+func getOrderHandler(d Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID := userIDFromContext(r.Context())
+		if userID == "" {
+			writeError(w, http.StatusUnauthorized, "no user in context")
+			return
+		}
+		uid, err := uuid.Parse(userID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid user id")
+			return
+		}
+		orderIDStr := chi.URLParam(r, "id")
+		orderID, err := uuid.Parse(orderIDStr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid order id")
+			return
+		}
+		order, err := d.TradingSvc.GetOrderForUser(r.Context(), orderID, uid)
+		if err != nil {
+			if errors.Is(err, trading.ErrOrderNotFound) {
+				writeError(w, http.StatusNotFound, "order not found")
+				return
+			}
+			d.Log.Error("get order failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, order)
+	}
+}

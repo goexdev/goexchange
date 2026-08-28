@@ -1460,6 +1460,23 @@ func (s *Service) getOrder(ctx context.Context, id uuid.UUID) (*OrderRecord, err
 	return o, nil
 }
 
+// GetOrderForUser returns the order if and only if it belongs to the
+// given user. The returned error is ErrOrderNotFound in both the
+// "row missing" and "row belongs to someone else" cases so callers
+// (e.g. the GET /api/v1/orders/{id} handler) can answer 404 to both
+// without leaking which id belongs to whom. (NEW-L4 from the 2026-08-28
+// v0.3 audit.)
+func (s *Service) GetOrderForUser(ctx context.Context, orderID, userID uuid.UUID) (*OrderRecord, error) {
+	o, err := s.getOrder(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	if o.UserID != userID {
+		return nil, ErrOrderNotFound
+	}
+	return o, nil
+}
+
 // ListOrders returns a user's recent orders.
 func (s *Service) ListOrders(ctx context.Context, userID uuid.UUID, limit int) ([]*OrderRecord, error) {
 	_ = ctx

@@ -231,6 +231,7 @@ func NewRouter(d Deps) http.Handler {
 			// Trading
 			r.With(orderLimiter.Middleware(userIDKeyFromContext)).Post("/orders", placeOrderHandler(d))
 			r.Get("/orders", listOrdersHandler(d))
+			r.Get("/orders/{id}", getOrderHandler(d)) // NEW-L4: read single order details
 			r.With(cancelLimiter.Middleware(userIDKeyFromContext)).Delete("/orders/{id}", cancelOrderHandler(d))
 			r.With(cancelLimiter.Middleware(userIDKeyFromContext)).Patch("/orders/{id}", amendOrderHandler(d))
 		r.With(cancelLimiter.Middleware(userIDKeyFromContext)).Delete("/orders", cancelAllOrdersHandler(d))

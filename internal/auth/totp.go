@@ -166,7 +166,24 @@ func (s *TOTPService) Enable(ctx context.Context, userID uuid.UUID, code string)
 }
 
 // Disable turns off 2FA (requires current code).
+// Err2FANotEnabled is returned when Disable / RegenerateBackupCodes are
+// called for an account that never enabled 2FA. We surface this
+// separately from "invalid code" so the SPA can show a useful message
+// (NEW-M2 from the 2026-08-28 v0.3 audit).
+var Err2FANotEnabled = errors.New("2fa is not enabled on this account")
+
+// Disable turns off 2FA (requires current code).
 func (s *TOTPService) Disable(ctx context.Context, userID uuid.UUID, currentCode string) error {
+	// NEW-M2: distinguish "you never enabled 2FA" from "wrong code".
+	// VerifyCode itself returns generic "invalid code" for both, so
+	// we check IsEnabled first.
+	enabled, err := s.IsEnabled(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return Err2FANotEnabled
+	}
 	if err := s.VerifyCode(ctx, userID, currentCode); err != nil {
 		return errors.New("invalid code: cannot disable 2FA")
 	}

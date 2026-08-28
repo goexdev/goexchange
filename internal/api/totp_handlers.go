@@ -125,10 +125,14 @@ func totpDisableHandler(d Deps) http.HandlerFunc {
 		}
 
 		if err := d.TOTPSvc.Disable(r.Context(), uid, in.Code); err != nil {
-			auditLogUserAction(d, r, "2fa.disable", uid, "", false, err)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
+				auditLogUserAction(d, r, "2fa.disable", uid, "", false, err)
+				if errors.Is(err, auth.Err2FANotEnabled) {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 
 		auditLogUserAction(d, r, "2fa.disable", uid, "", true, nil)
 
