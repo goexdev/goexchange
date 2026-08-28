@@ -1,9 +1,11 @@
 package api
 
 import (
-	"github.com/go-chi/chi/v5"
+	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
@@ -120,6 +122,12 @@ var _ = chainwatcher.Service{}
 // createWithdrawalHandler handles POST /api/v1/withdrawals.
 //
 // Withdraws asset to external address.
+//
+// Error reporting is precise per field. The previous version returned
+// "invalid json" for any enum / unknown-field error which made
+// debugging impossible (NEW-H2 from the 2026-08-28 v0.3 audit). We now
+// run the JSON parse and the field validations separately so each step
+// can name the specific problem.
 func createWithdrawalHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := userIDFromContext(r.Context())
@@ -133,17 +141,28 @@ func createWithdrawalHandler(d Deps) http.HandlerFunc {
 			return
 		}
 
+		// Parse body without strict unknown-field rejection — callers
+		// regularly typo `address` vs `dest_address`. We validate each
+		// well-known field below and ignore anything else so a typo
+		// surfaces as "dest_address required" rather than "invalid json".
 		var in struct {
 			Asset       string `json:"asset"`
 			Amount      string `json:"amount"`
 			DestAddress string `json:"dest_address"`
 		}
-		if err := decodeJSON(r, &in); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid json")
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
+
+		// Field-by-field validation. Each branch reports the exact
+		// problem with the offending field name.
 		if in.Asset == "" {
 			in.Asset = "BTC"
+		} else if !validWithdrawAsset(in.Asset) {
+			writeError(w, http.StatusBadRequest,
+				"asset must be one of: BTC, ETH, BNB, SOL, USDT, USDC")
+			return
 		}
 		if in.Amount == "" {
 			writeError(w, http.StatusBadRequest, "amount required")
@@ -156,12 +175,24 @@ func createWithdrawalHandler(d Deps) http.HandlerFunc {
 
 		amount, err := decimal.NewFromString(in.Amount)
 		if err != nil || !amount.IsPositive() {
-			writeError(w, http.StatusBadRequest, "invalid amount")
+			writeError(w, http.StatusBadRequest, "amount must be a positive decimal string")
 			return
 		}
 
 		wd, err := d.ChainWatcherSvc.WithdrawWithSigner(r.Context(), uid, in.Asset, in.DestAddress, amount)
 		if err != nil {
+			// Surface known user errors verbatim; anything else is a
+			// 5xx that the middleware already redacts to "internal
+			// error" — but the service sometimes returns wrapped
+			// pgx errors as 400s so we still log here for forensics.
+			d.Log.Warn("withdraw rejected", "user_id", uid, "asset", in.Asset, "error", err)
+			if errors.Is(err, chainwatcher.ErrInvalidAmount) ||
+				errors.Is(err, chainwatcher.ErrInsufficientBalance) ||
+				errors.Is(err, chainwatcher.ErrWithdrawalBlocked) ||
+				errors.Is(err, chainwatcher.ErrWithdrawLimitExceeded) {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -175,6 +206,15 @@ func createWithdrawalHandler(d Deps) http.HandlerFunc {
 
 		writeJSON(w, http.StatusCreated, wd)
 	}
+}
+
+// validWithdrawAsset mirrors the supported currencies in the seed data.
+func validWithdrawAsset(s string) bool {
+	switch s {
+	case "BTC", "ETH", "BNB", "SOL", "USDT", "USDC":
+		return true
+	}
+	return false
 }
 
 // listWithdrawalsHandler handles GET /api/v1/withdrawals (authenticated).
