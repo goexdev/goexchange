@@ -11,7 +11,9 @@
 set -e
 
 VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_TOKEN="${VAULT_TOKEN:?VAULT_TOKEN required}"
+# Default token matches compose VAULT_DEV_ROOT_TOKEN_ID. In
+# production, pass VAULT_TOKEN explicitly (or run after `vault login`).
+VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}"
 export VAULT_ADDR VAULT_TOKEN
 
 echo "==> Setting up goexchange secrets in Vault..."

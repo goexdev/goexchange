@@ -197,6 +197,40 @@ for i in $(seq 1 30); do
 done
 
 # ============================================================================
+# Step 3.5: seed Vault secrets (idempotent — re-running setup-vault.sh
+#           just upserts the same secret paths). Skipped if the deploy is
+#           marked SKIP_VAULT_SETUP=1 (for production-style deploys where
+#           an operator manages Vault out-of-band).
+# ============================================================================
+if [ "${SKIP_VAULT_SETUP:-0}" = "1" ]; then
+    log "=== Step 3.5: SKIP_VAULT_SETUP=1, skipping vault seed ==="
+else
+    log "=== Step 3.5: seed Vault secrets ==="
+    if [ ! -f "$PUBLIC_DIR/deploy/vault/setup-vault.sh" ]; then
+        warn "setup-vault.sh not found at $PUBLIC_DIR/deploy/vault/setup-vault.sh; skipping vault seed"
+    else
+        # Wait briefly for vault container health endpoint to come up.
+        # The compose healthcheck already gated us on `pg_isready`/matching,
+        # but the Vault container's healthcheck takes a few seconds too.
+        # VAULT_ADDR defaults to host-mapped 8200 since this step runs
+        # on the host (setup-vault.sh uses the vault CLI directly).
+        VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+        for i in $(seq 1 15); do
+            if curl -sf "$VAULT_ADDR/v1/sys/health" >/dev/null 2>&1; then
+                break
+            fi
+            [ "$i" = "15" ] && warn "vault health endpoint not responding; setup-vault.sh may fail"
+            sleep 1
+        done
+        VAULT_ADDR="$VAULT_ADDR" \
+            VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}" \
+            bash "$PUBLIC_DIR/deploy/vault/setup-vault.sh" 2>&1 | tail -20 \
+            && ok "vault secrets seeded" \
+            || warn "vault seed reported errors; check output above (continuing — dev stack still works)"
+    fi
+fi
+
+# ============================================================================
 # Step 4: run migrations
 # ============================================================================
 log "=== Step 4: apply DB migrations ==="
