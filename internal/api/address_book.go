@@ -18,16 +18,17 @@ func listAddressesHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		asset := r.URL.Query().Get("asset")
+		asset := strings.ToUpper(r.URL.Query().Get("asset"))
 		addrs, err := d.UserSvc.ListAddresses(r.Context(), userID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			d.Log.Error("list addresses failed", "user_id", userID, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		if asset != "" {
 			filtered := []user.AddressBookEntry{}
 			for _, a := range addrs {
-				if a.Asset == strings.ToUpper(asset) {
+				if a.Asset == asset {
 					filtered = append(filtered, a)
 				}
 			}
@@ -57,11 +58,30 @@ func addAddressHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid json")
 			return
 		}
+		// Field validation — return precise per-field error instead of
+		// letting the DB layer return a raw SQL error (which the H2
+		// audit of 2026-08-28 v0.2 + v0.3's NEW-H3 both flagged).
+		in.Asset = strings.ToUpper(strings.TrimSpace(in.Asset))
+		if in.Asset == "" || in.Address == "" {
+			writeError(w, http.StatusBadRequest, "asset and address required")
+			return
+		}
+		if !validAddressAsset(in.Asset) {
+			writeError(w, http.StatusBadRequest,
+				"asset must be one of: BTC, ETH, BNB, SOL, USDT, USDC")
+			return
+		}
 		entry, err := d.UserSvc.AddAddress(r.Context(), userID, user.AddAddressInput{
 			Asset: in.Asset, Address: in.Address, Label: in.Label, Whitelisted: in.Whitelisted,
 		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			// 5xx — never echo raw pgx errors to the client. Log
+			// the detail for operators and return a generic message
+			// (writeError already does the redaction; this comment
+			// documents the policy for the next person who edits
+			// this file).
+			d.Log.Error("add address failed", "user_id", userID, "asset", in.Asset, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		writeJSON(w, http.StatusCreated, entry)
@@ -83,7 +103,8 @@ func deleteAddressHandler(d Deps) http.HandlerFunc {
 			return
 		}
 		if err := d.UserSvc.DeleteAddress(r.Context(), userID, id); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			d.Log.Error("delete address failed", "user_id", userID, "address_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -116,9 +137,22 @@ func updateAddressHandler(d Deps) http.HandlerFunc {
 			Label: in.Label, Whitelisted: in.Whitelisted,
 		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			d.Log.Error("update address failed", "user_id", userID, "address_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		writeJSON(w, http.StatusOK, entry)
 	}
+}
+
+// validAddressAsset mirrors the supported withdrawal currencies. Kept
+// in the API layer (rather than hitting the DB or currencies service)
+// because the address book is a small enumeration and the user-facing
+// error must use the same wording as the withdraw endpoint.
+func validAddressAsset(s string) bool {
+	switch s {
+	case "BTC", "ETH", "BNB", "SOL", "USDT", "USDC":
+		return true
+	}
+	return false
 }

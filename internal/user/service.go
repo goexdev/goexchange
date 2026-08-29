@@ -445,8 +445,8 @@ func (s *Service) AddAddress(ctx context.Context, userID uuid.UUID, in AddAddres
 	var e AddressBookEntry
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO withdrawal_addresses (user_id, asset, address, label, whitelisted)
-		 VALUES ($1, $2, $3, NULLIF($4, ''), $5)
-		 RETURNING id, user_id, asset, address, COALESCE(label, ''), whitelisted, last_used_at, created_at, updated_at`,
+		 VALUES ($1, $2, $3, $4, $5)
+		 RETURNING id, user_id, asset, address, label, whitelisted, last_used_at, created_at, updated_at`,
 		userID, in.Asset, in.Address, in.Label, in.Whitelisted,
 	).Scan(&e.ID, &e.UserID, &e.Asset, &e.Address, &e.Label, &e.Whitelisted, &e.LastUsedAt, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
@@ -477,7 +477,7 @@ func (s *Service) UpdateAddress(ctx context.Context, userID, addressID uuid.UUID
 			l = l[:64]
 		}
 		_, err := s.pool.Exec(ctx,
-			`UPDATE withdrawal_addresses SET label = NULLIF($1, ''), updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+			`UPDATE withdrawal_addresses SET label = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
 			l, addressID, userID)
 		if err != nil {
 			return nil, err
@@ -493,7 +493,7 @@ func (s *Service) UpdateAddress(ctx context.Context, userID, addressID uuid.UUID
 	}
 	var e AddressBookEntry
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, user_id, asset, address, COALESCE(label, ''), whitelisted, last_used_at, created_at, updated_at
+		`SELECT id, user_id, asset, address, label, whitelisted, last_used_at, created_at, updated_at
 		 FROM withdrawal_addresses WHERE id = $1 AND user_id = $2`,
 		addressID, userID,
 	).Scan(&e.ID, &e.UserID, &e.Asset, &e.Address, &e.Label, &e.Whitelisted, &e.LastUsedAt, &e.CreatedAt, &e.UpdatedAt)
