@@ -3,24 +3,25 @@
 # GoExchange - Fresh Deploy Script
 # Version: 3.0 (2026-08-27)
 #
-# 一键从零部署完整 goexchange 系统:
+# One-shot fresh deployment of the full goexchange stack:
 #   - Postgres + Redis + Vault (docker compose)
-#   - 撮合闭源 engine (docker image 来自 ghcr.io)
-#   - 公开仓 API + scheduler (主机编译运行)
+#   - Matching engine (closed-source docker image from ghcr.io)
+#   - Public repo API + scheduler (compiled and run on the host)
 #
-# 用法:
+# Usage:
 #   cd $PUBLIC_DIR
 #   bash deploy-fresh.sh
 #
-# 假设环境:
-#   - root 用户
-#   - Ubuntu 22.04+ (任意 systemd Linux)
-#   - /usr/local/go/bin/go 存在 (go 1.25+)
-#   - docker + docker compose plugin 已装
-#   - $PUBLIC_DIR 已 git clone
-#   - /root/goexchange-core 已 git clone (闭源)
+# Assumed environment:
+#   - root user
+#   - Ubuntu 22.04+ (any systemd-based Linux)
+#   - /usr/local/go/bin/go present (go 1.25+)
+#   - docker + docker compose plugin installed
+#   - $PUBLIC_DIR is already a git clone
+#   - /root/goexchange-core is already a git clone (closed source)
 #
-# WARNING: 这会清空所有数据库数据并重建. 不要在生产跑.
+# WARNING: this script WIPES all database data and rebuilds. Do NOT
+# run against a production database.
 ################################################################################
 
 set -e
@@ -42,7 +43,8 @@ CORE_DIR="/root/${REPO_NAME}-core"
 GO_BIN="/usr/local/go/bin/go"
 export PATH="/usr/local/go/bin:/root/go/bin:$PATH"
 
-# Database (compose 容器内 hardcode 密码 = exchange; 公开仓 config.yaml 锁的就是这个)
+# Database — password is hard-coded in the compose container as
+# `exchange`; the public repo's config.yaml expects the same.
 DB_USER="exchange"
 DB_PASS="exchange"
 DB_NAME="exchange"
@@ -54,7 +56,7 @@ MATCHING_CONTAINER="goexchange-matching"
 MATCHING_HOST_PORT="50051"
 MATCHING_IMAGE="ghcr.io/goexdev/goexchange-core:latest"
 
-# API / scheduler (host 跑)
+# API / scheduler (run on host)
 API_PORT="8099"
 SCHEDULER_PORT="8097"
 
