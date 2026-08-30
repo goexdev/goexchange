@@ -227,6 +227,25 @@ else
             bash "$PUBLIC_DIR/deploy/vault/setup-vault.sh" 2>&1 | tail -20 \
             && ok "vault secrets seeded" \
             || warn "vault seed reported errors; check output above (continuing — dev stack still works)"
+
+        # After seeding, if approle auth is configured, mint a
+        # fresh secret_id and overwrite VAULT_TOKEN in .env. The
+        # previous secret_id may have expired (24h TTL by
+        # default) so any post-deploy API restart would otherwise
+        # fail auth. We only run this on dev where auth_method
+        # matches the static root token we used for seeding.
+        if [ "${VAULT_AUTH_METHOD:-approle}" = "approle" ]; then
+            SECRET_ID=$(VAULT_ADDR="$VAULT_ADDR" \
+                VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}" \
+                vault write -f -field=secret_id \
+                auth/approle/role/goexchange/secret-id 2>/dev/null || echo "")
+            if [ -n "$SECRET_ID" ] && [ -f "$PUBLIC_DIR/.env" ]; then
+                sed -i "s|^VAULT_TOKEN=.*|VAULT_TOKEN=$SECRET_ID|" "$PUBLIC_DIR/.env"
+                ok "approle secret_id rotated and written to .env"
+            else
+                warn "approle secret_id rotation failed (continuing — API may need manual restart after secret_id expires)"
+            fi
+        fi
     fi
 fi
 
@@ -318,8 +337,11 @@ if [ ! -f .env ] || grep -q '\*\*\*' .env; then
     # .env.example ships with literal `***` placeholders from the old
     # repo state; rewrite them to the dev password so a fresh deploy
     # does not need to hand-edit. Also point the DB host at host-mapped
-    # port 5433 instead of the compose-internal 5432.
-    sed -i 's|exchange:\*\*\*|exchange:exchange|g; s|:5432|:5433|g' .env
+    # port 5433 instead of the compose-internal 5432. And rewrite
+    # VAULT_ADDR to the host-mapped port because the API runs on the
+    # host, not inside the docker network, so the service-name form
+    # (http://vault:8200) does not resolve from here.
+    sed -i 's|exchange:\*\*\*|exchange:exchange|g; s|:5432|:5433|g; s|VAULT_ADDR=http://vault:8200|VAULT_ADDR=http://127.0.0.1:8200|g' .env
     ok ".env (re)created from .env.example with placeholder fixes"
 fi
 

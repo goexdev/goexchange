@@ -224,6 +224,27 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("JWT_SECRET"); v != "" {
 		cfg.JWT.Secret = v
 	}
+	// Vault env overrides. These let the deploy script
+	// (deploy-fresh.sh) inject credentials without writing them to
+	// config.yaml. VAULT_TOKEN doubles as the static root token AND
+	// the approle secret_id — the API picks based on
+	// vault.auth_method.
+	if v := os.Getenv("VAULT_ADDR"); v != "" {
+		cfg.Vault.Address = v
+	}
+	if v := os.Getenv("VAULT_TOKEN"); v != "" {
+		if cfg.Vault.AuthMethod == "approle" {
+			cfg.Vault.AppSecretID = v
+		} else {
+			cfg.Vault.Token = v
+		}
+	}
+	if v := os.Getenv("VAULT_ROLE_ID"); v != "" {
+		cfg.Vault.AppRoleID = v
+	}
+	if v := os.Getenv("VAULT_AUTH_METHOD"); v != "" {
+		cfg.Vault.AuthMethod = v
+	}
 
 	// Validate
 	// jwt.secret can be empty if Vault is enabled (will be loaded from Vault)

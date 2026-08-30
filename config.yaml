@@ -25,24 +25,39 @@ vault:
 
   # Auth method
   # auth_method: "static"      # DEV only (NEVER in production)
-  auth_method: "static"    # PROD: role_id + secret_id (auto-rotating tokens)
-  app_role_id: ""
-  app_secret_id: "b5520d44-f269-cfa6-b6bc-f72ba81be5e3"
+  auth_method: "approle"      # role_id + secret_id (auto-rotating tokens)
+  # Production approle credentials. The role_id is stable; the
+  # secret_id is rotated by deploy-fresh.sh and stored in .env as
+  # VAULT_TOKEN (the env var is reused for both static and approle
+  # — the API picks approle when auth_method=approle). NEVER
+  # commit a real secret_id here — leave it empty and let the
+  # deploy script populate .env.
+  app_role_id: "fd4104be-0ad7-2c2e-2ce1-a738f4045066"
+  app_secret_id: ""
   # k8s_role: "goexchange"   # K8s ServiceAccount auth (for K8s deploys)
 
   # Dev-mode root token from compose VAULT_DEV_ROOT_TOKEN_ID.
-  # Production must use approle or k8s auth instead.
+  # Used only when auth_method=static (see .env for the
+  # approle secret_id that overrides this in production).
   token: "please_change_me"
 
   # Caching TTL (5 min)
   cache_ttl_sec: 300
 
-  # Paths to secrets. Empty paths mean "skip loading this secret"
-  # — keeps DB password / JWT secret sourced from config.yaml so
-  # the rest of the system stays on its existing config. Only the
-  # chainwatcher hot-wallet private keys come from Vault.
-  db_path: ""
-  jwt_path: ""
+  # Paths to secrets. Both paths are loaded at startup; the
+  # values in Vault OVERRIDE the corresponding config.yaml
+  # entries. Empty path means "skip loading this secret" and
+  # keep using config.yaml.
+  #
+  # db_path: secret containing host/port/user/password/database;
+  #          the loader builds `postgres://USER:PASS@HOST:PORT/DB`
+  #          and replaces cfg.Database.URL with it.
+  # jwt_path: secret containing `secret` (hex) and `ttl_seconds`;
+  #          the loader replaces cfg.JWT.Secret with the Vault
+  #          value so JWT tokens issued before vs after a rotation
+  #          cannot both verify.
+  db_path: "db/postgres"
+  jwt_path: "auth/jwt"
 
 chainwatcher:
   driver: "evm"
@@ -82,7 +97,7 @@ chainwatcher:
       signer: "btc-core"
 
     eth:
-      enabled: false
+      enabled: true               # enabled - vault signer path (HD derivation + EVM)
       driver: "evm"
       rpc_url: "https://ethereum-rpc.publicnode.com"
       asset: "ETH"

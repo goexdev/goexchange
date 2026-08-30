@@ -143,6 +143,9 @@ path "secret/data/db/postgres" { capabilities = ["read"] }
 path "secret/data/auth/jwt"    { capabilities = ["read"] }
 path "secret/data/notifier/*"  { capabilities = ["read"] }
 
+# HD wallet mnemonic (shared BIP-39 seed for all EVM chains)
+path "secret/data/hd/mnemonic" { capabilities = ["read"] }
+
 # Hot wallets for all chains
 path "secret/data/eth/hot-wallet"      { capabilities = ["read"] }
 path "secret/data/bsc/hot-wallet"      { capabilities = ["read"] }
