@@ -103,6 +103,55 @@ func NewRouter(d Deps) http.Handler {
 	})
 	r.Handle("/metrics", promhttp.Handler())
 
+	// =========================================================================
+	// Public user-facing programmatic API (/user-api/v2).
+	//
+	// This is a separate path from /api/v1 because the auth model
+	// differs (api-key + nonce vs Bearer JWT), the audience differs
+	// (external integrations, bots, scripts vs human users), and the
+	// traffic profile differs (high-volume automated calls vs
+	// interactive UI requests). Keeping them as distinct route groups
+	// lets us apply different rate limits, CORS rules, and observability
+	// without bleeding state between them.
+	//
+	// Note: this MUST be registered on the root chi.Router, not
+	// inside the /api/v1 sub-router that follows. Go closure
+	// scoping means a `r.Route("/user-api/v2", ...)` placed inside
+	// the /api/v1 func would shadow `r` to the /api/v1 sub-router
+	// and end up mounted at /api/v1/user-api/v2.
+	//
+	// Auth: X-Api-Key + X-Api-Nonce headers, validated by
+	// userAPIKeyAuth which also enforces ±5min clock skew and nonce
+	// monotonicity per key. See apikey_middleware.go.
+	// =========================================================================
+	r.Route("/user-api/v2", func(r chi.Router) {
+		// Public endpoints — no api key required, no rate limit
+		// beyond the implicit infra (nginx already enforces a
+		// reasonable ceiling). These mirror the public market data
+		// endpoints under /api/v1 so script authors only have to
+		// learn one URL shape.
+		r.Get("/ping", userAPIPingHandler(d))
+		r.Get("/server-time", userAPIServerTimeHandler(d))
+		r.Get("/markets", userAPIListMarketsHandler(d))
+		r.Get("/markets/{base}/{quote}/ticker", userAPIMarketTickerHandler(d))
+		r.Get("/markets/{base}/{quote}/orderbook", userAPIMarketOrderBookHandler(d))
+		r.Get("/markets/{base}/{quote}/trades", userAPIMarketRecentTradesHandler(d))
+		r.Get("/currencies", userAPIListCurrenciesHandler(d))
+
+		// Private endpoints — require api key auth. The
+		// middleware puts user_id + scopes in context; handlers
+		// that need scope enforcement wrap with requireScope.
+		r.Group(func(r chi.Router) {
+			r.Use(userAPIKeyAuth(d.APIKeys))
+
+			r.Get("/balances", userAPIListBalancesHandler(d))
+
+			r.With(requireScope(ScopeTrade)).Post("/orders", userAPIPlaceOrderHandler(d))
+			r.With(requireScope(ScopeTrade)).Delete("/orders/{id}", userAPIcancelOrderHandler(d))
+			r.With(requireScope(ScopeRead)).Get("/orders", userAPIListOrdersHandler(d))
+		})
+	})
+
 	// API v1
 	r.Route("/api/v1", func(r chi.Router) {
 		// Public - rate limited
@@ -217,8 +266,9 @@ func NewRouter(d Deps) http.Handler {
 		r.Get("/pairs", adminListPairsHandler(d))
 		r.Post("/pairs/toggle", adminTogglePairHandler(d))
 	})
-			r.Get("/wallets", getWalletHandler(d))
-			r.Get("/wallets/{asset}", getOneWalletHandler(d))
+
+	r.Get("/wallets", getWalletHandler(d))
+		r.Get("/wallets/{asset}", getOneWalletHandler(d))
 			r.Get("/deposits", listDepositsHandler(d))
 		r.Post("/deposits/import", importDepositsFromChainHandler(d))
 			r.Post("/admin/spawn-deposit", spawnDepositHandler(d))

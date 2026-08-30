@@ -26,6 +26,11 @@ type Key struct {
 	ExpiresAt  *time.Time `json:"expires_at"`
 	Revoked    bool       `json:"revoked"`
 	CreatedAt  time.Time  `json:"created_at"`
+
+	// LastNonce is the highest accepted nonce for this key.
+	// Not exposed via JSON; used only by ValidateHMAC for replay
+	// protection.
+	LastNonce int64 `json:"-"`
 }
 
 // Scopes
@@ -37,7 +42,13 @@ const (
 
 // Errors
 var (
-	ErrKeyNotFound = errors.New("api key not found")
+	ErrKeyNotFound   = errors.New("api key not found")
+	ErrKeyRevoked    = errors.New("api key revoked")
+	ErrKeyExpired    = errors.New("api key expired")
+	ErrNonceTooOld   = errors.New("nonce too old")
+	ErrNonceReplayed = errors.New("nonce already used")
+	ErrBadSignature  = errors.New("invalid signature")
+	ErrClockSkew     = errors.New("request timestamp outside accepted window")
 )
 
 // Service manages API keys.
@@ -147,8 +158,13 @@ func (s *Service) Revoke(ctx context.Context, userID, keyID uuid.UUID) error {
 	return nil
 }
 
-// Authenticate verifies an API key and returns the associated user ID.
-// Returns nil key if invalid or revoked.
+// Authenticate verifies an API key without HMAC (used by
+// endpoints that pass the full key in plain text, e.g. server-to-
+// server integrations). Returns the Key on success.
+//
+// For HMAC-signed requests (the typical path for external user
+// integrations) use ValidateHMAC instead, which additionally
+// checks the timestamp window, nonce monotonicity, and signature.
 func (s *Service) Authenticate(ctx context.Context, fullKey string) (*Key, error) {
 	// Extract the public key_id (gk_live_<8 hex>)
 	if !strings.HasPrefix(fullKey, "gk_") {
@@ -177,7 +193,7 @@ func (s *Service) Authenticate(ctx context.Context, fullKey string) (*Key, error
 
 	// Check expiry
 	if k.ExpiresAt != nil && k.ExpiresAt.Before(time.Now()) {
-		return nil, fmt.Errorf("key expired")
+		return nil, ErrKeyExpired
 	}
 
 	// Verify bcrypt
@@ -195,4 +211,109 @@ func (s *Service) Authenticate(ctx context.Context, fullKey string) (*Key, error
 	}()
 
 	return k, nil
+}
+
+// HMACVerifyResult is returned by ValidateRequest on success. It
+// carries everything the middleware needs to set up the request
+// context.
+type HMACVerifyResult struct {
+	Key    *Key
+	Scopes []string
+	Nonce  int64
+}
+
+// ValidateRequest authenticates a user-api request using the
+// three-header scheme:
+//
+//   X-Api-Key:    "gk_live_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxx"
+//                 (the full key, shown once to the user at
+//                 creation; never stored in plaintext by us)
+//   X-Api-Nonce:  unix ms timestamp; must be strictly greater
+//                 than the last accepted nonce for this key
+//
+// This is a simpler auth model than HMAC signing because:
+//   - the full key itself is the credential (no shared secret
+//     that needs to live in two places)
+//   - bcrypt comparison is slow (~100ms) so brute force on the
+//     key is infeasible
+//   - the nonce + timestamp window blocks replay within ±5min
+//   - TLS protects the key in transit
+//
+// The downside vs HMAC is that the server must hold a bcrypt
+// hash, not a SHA hash of the secret. We already do (see
+// Generate()), so this just changes how the client authenticates.
+//
+// On any failure returns one of the typed errors above; callers
+// should map them to 401/403 HTTP statuses (no detail leak).
+func (s *Service) ValidateRequest(ctx context.Context, fullKey string, nonce int64) (*HMACVerifyResult, error) {
+	// Extract the public key_id (gk_live_<8 hex>)
+	if !strings.HasPrefix(fullKey, "gk_") {
+		return nil, ErrKeyNotFound
+	}
+	parts := strings.SplitN(fullKey, "_", 4)
+	if len(parts) < 3 {
+		return nil, ErrKeyNotFound
+	}
+	keyID := parts[0] + "_" + parts[1] + "_" + parts[2]
+
+	// Step 1: lookup
+	k := &Key{}
+	row := s.pool.QueryRow(ctx,
+		`SELECT id, user_id, name, key_id, key_hash, scopes,
+		        last_used_at, expires_at, revoked, created_at, last_nonce
+		 FROM api_keys
+		 WHERE key_id = $1 AND NOT revoked`,
+		keyID,
+	)
+	if err := row.Scan(&k.ID, &k.UserID, &k.Name, &k.KeyID, &k.KeyHash,
+		&k.Scopes, &k.LastUsedAt, &k.ExpiresAt, &k.Revoked, &k.CreatedAt, &k.LastNonce); err != nil {
+		return nil, ErrKeyNotFound
+	}
+
+	// Step 1b: expiry
+	if k.ExpiresAt != nil && k.ExpiresAt.Before(time.Now()) {
+		return nil, ErrKeyExpired
+	}
+
+	// Step 2: timestamp window. Accept ±5 minutes of clock skew.
+	const skewMs = 5 * 60 * 1000
+	nowMs := time.Now().UnixMilli()
+	if nonce < nowMs-skewMs || nonce > nowMs+skewMs {
+		return nil, ErrClockSkew
+	}
+
+	// Step 3: nonce monotonicity
+	if nonce <= k.LastNonce {
+		return nil, ErrNonceReplayed
+	}
+
+	// Step 4: bcrypt the full key. This is the credential check;
+	// ~100ms of work on the server, infeasible to brute force
+	// against the 32-hex-char suffix alone.
+	if err := bcrypt.CompareHashAndPassword([]byte(k.KeyHash), []byte(fullKey)); err != nil {
+		return nil, ErrKeyNotFound
+	}
+
+	// Step 5: persisted nonce. The UPDATE has a WHERE last_nonce
+	// guard so two concurrent requests with the same nonce both
+	// cannot succeed (the second sees RowsAffected == 0 and we
+	// return ErrNonceReplayed).
+	result, err := s.pool.Exec(ctx,
+		`UPDATE api_keys
+		    SET last_used_at = NOW(), last_nonce = $1
+		  WHERE id = $2 AND last_nonce < $1`,
+		nonce, k.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("nonce update: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return nil, ErrNonceReplayed
+	}
+
+	return &HMACVerifyResult{
+		Key:    k,
+		Scopes: k.Scopes,
+		Nonce:  nonce,
+	}, nil
 }
