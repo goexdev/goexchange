@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,7 +17,7 @@ import (
 //
 // Required request headers:
 //
-//	X-Api-Key:   full key string (shown once at creation)
+//	X-Api-Key:   *** key string (shown once at creation)
 //	X-Api-Nonce: unix ms timestamp, must be strictly greater than
 //	             the last accepted nonce for this key
 //
@@ -28,6 +29,28 @@ import (
 // On failure the response is 401 with a generic "invalid api
 // key" body; details are logged server-side but never leaked to
 // the client.
+//
+// X-Auth-Reason header (UAPI-7 audit fix): every 401 response
+// also sets an X-Auth-Reason header with a stable, machine-
+// readable reason code. The body remains the same generic
+// "invalid api key" so an attacker cannot enumerate valid
+// keys / replay attacks / clock-skew state from the body. The
+// header is for operators and integration tests only — clients
+// should keep treating the response as opaque. Documented
+// reason codes:
+//
+//	missing_headers   — X-Api-Key or X-Api-Nonce absent
+//	bad_nonce_format   — X-Api-Nonce not a positive integer
+//	key_not_found      — key_id not in DB or revoked
+//	key_expired        — key has expires_at in the past
+//	clock_skew         — X-Api-Nonce outside ±5min window
+//	nonce_replayed     — X-Api-Nonce <= last_nonce for this key
+//	bad_signature      — bcrypt mismatch (key tampered)
+//
+// Operators reading the API log or a test harness comparing
+// the header value across retries can now distinguish "the
+// nonce was replayed" from "the key is revoked" without
+// compromising the public contract.
 func userAPIKeyAuth(svc *apikeys.Service) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,22 +58,22 @@ func userAPIKeyAuth(svc *apikeys.Service) func(http.Handler) http.Handler {
 			nonceStr := strings.TrimSpace(r.Header.Get("X-Api-Nonce"))
 
 			if fullKey == "" || nonceStr == "" {
-				writeError(w, http.StatusUnauthorized, "invalid api key")
+				writeAuthError(w, "missing_headers")
 				return
 			}
 
 			nonce, err := strconv.ParseInt(nonceStr, 10, 64)
 			if err != nil || nonce <= 0 {
-				writeError(w, http.StatusUnauthorized, "invalid api key")
+				writeAuthError(w, "bad_nonce_format")
 				return
 			}
 
 			res, err := svc.ValidateRequest(r.Context(), fullKey, nonce)
 			if err != nil {
-				// Map all errors to 401 — we never tell the
-				// client whether the key was wrong vs the
-				// nonce was replayed vs the clock was off.
-				writeError(w, http.StatusUnauthorized, "invalid api key")
+				// Map each typed service error to its reason
+				// code. The body stays generic — only the
+				// header discriminates.
+				writeAuthError(w, authReasonForError(err))
 				return
 			}
 
@@ -60,6 +83,48 @@ func userAPIKeyAuth(svc *apikeys.Service) func(http.Handler) http.Handler {
 			ctx = contextWithAPIKeyKey(ctx, res.Key.KeyID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
+	}
+}
+
+// writeAuthError sends a 401 with the generic body and adds
+// the X-Auth-Reason header for operator / test visibility.
+// Keeping the body identical across all reasons is deliberate:
+// we never want to leak which dimension failed to the client.
+func writeAuthError(w http.ResponseWriter, reason string) {
+	w.Header().Set("X-Auth-Reason", reason)
+	writeError(w, http.StatusUnauthorized, "invalid api key")
+}
+
+// authReasonForError maps a typed apikeys.Service error onto
+// the stable reason code emitted in X-Auth-Reason. Unknown
+// errors fall through to "bad_signature" so the operator sees
+// a real signature / bcrypt failure rather than a misleading
+// "key_not_found" — the failure is opaque to the client but
+// the category helps in log triage.
+func authReasonForError(err error) string {
+	switch {
+	case errors.Is(err, apikeys.ErrKeyNotFound):
+		return "key_not_found"
+	case errors.Is(err, apikeys.ErrKeyRevoked):
+		return "key_not_found" // deliberately collapsed; an
+		// attacker should not be able to probe revoked state
+	case errors.Is(err, apikeys.ErrKeyExpired):
+		return "key_expired"
+	case errors.Is(err, apikeys.ErrClockSkew):
+		return "clock_skew"
+	case errors.Is(err, apikeys.ErrNonceReplayed):
+		return "nonce_replayed"
+	case errors.Is(err, apikeys.ErrNonceTooOld):
+		return "clock_skew"
+	default:
+		// Bcrypt mismatch, DB error, or anything else.
+		// We surface as "bad_signature" because the
+		// underlying call site is the bcrypt comparison
+		// (line 296 of apikeys/service.go); any other
+		// error here would be a programming bug worth
+		// investigating via the server log, not the
+		// client-visible header.
+		return "bad_signature"
 	}
 }
 

@@ -145,10 +145,22 @@ func (r *ChainRegistry) SyncFromConfig(ctx context.Context, newConfigs map[strin
 
 	// Add new or update changed chains
 	for chainID, newCfg := range newConfigs {
+		oldCfg, existed := r.configs[chainID]
 		if !newCfg.Enabled {
+			// Disabled chains have no driver but we still
+			// store their config so lookups by asset name
+			// ("does this asset belong to a configured
+			// chain?") return the chain ID and the
+			// service can return a 503 / "chain disabled"
+			// error rather than falling through to the
+			// default driver.
+			if !existed {
+				r.configs[chainID] = newCfg
+				changes = append(changes,
+					fmt.Sprintf("disabled chain %s kept in registry", chainID))
+			}
 			continue
 		}
-		oldCfg, existed := r.configs[chainID]
 		if !existed {
 			drv, err := BuildDriver(ctx, newCfg, r.deps)
 			if err != nil {

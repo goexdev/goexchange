@@ -643,14 +643,19 @@ func (s *Service) DriverName() string {
 // Returns existing assigned address if any.
 // Otherwise generates a new one via the right chain's driver.
 func (s *Service) GetDepositAddress(ctx context.Context, userID uuid.UUID, asset string) (string, error) {
-	// Check existing
+	// Check existing. We look up by (user_id, asset) rather
+	// than (user_id, chain, asset) because a single asset can
+	// be served by more than one chain in theory (USDT is
+	// on eth / polygon / bsc / etc.) and the migration
+	// unique key is (user_id, chain, asset). Restricting
+	// the lookup to a single chain would miss rows allocated
+	// under a sibling chain and risk inserting a duplicate.
 	var addr string
-	chain := s.chainForAsset(asset)
 	err := s.pool.QueryRow(ctx, `
 		SELECT address FROM assigned_addresses
-		WHERE user_id = $1 AND chain = $2
+		WHERE user_id = $1 AND asset = $2
 		LIMIT 1
-	`, userID, chain).Scan(&addr)
+	`, userID, asset).Scan(&addr)
 	if err == nil {
 		return addr, nil
 	}
@@ -665,6 +670,15 @@ func (s *Service) GetDepositAddress(ctx context.Context, userID uuid.UUID, asset
 func (s *Service) AllocateAddress(ctx context.Context, userID uuid.UUID, asset string) (string, error) {
 	drv := s.driverForAsset(asset)
 	if drv == nil {
+		// driverForAsset returns nil when the registry knows
+		// the asset belongs to a configured chain but the
+		// chain is disabled (no driver instance was built
+		// at startup). Distinguish that from "no such chain
+		// at all" so the handler can return the right status
+		// code — 503 (chain disabled) vs 404 (asset unknown).
+		if s.registry != nil && s.registry.ChainIDForAsset(asset) != "" {
+			return "", fmt.Errorf("chain %s disabled", s.registry.ChainIDForAsset(asset))
+		}
 		return "", fmt.Errorf("no driver for asset %s", asset)
 	}
 	addr, err := drv.GenerateAddress(ctx)
@@ -1316,10 +1330,33 @@ func (s *Service) RejectHeldWithdrawal(ctx context.Context, id uuid.UUID, reason
 
 // driverForAsset returns the right driver for the asset via the registry.
 // Falls back to s.driver if registry not initialized.
+//
+// UAPI-6 fix: returns nil if the registry knows the chain for
+// this asset but the driver is not registered — which is the
+// signature of "chain configured but disabled". Callers MUST
+// handle the nil return explicitly; previously they would
+// silently fall back to the default driver and try to insert
+// a placeholder address, which then hit a unique-key
+// constraint against an earlier allocated row.
+//
+// Note: we resolve via the registry's `drivers` map (chain_id
+// → Driver) rather than its `configs` map because a chain
+// block in config.yaml may omit the `asset:` field (BTC
+// currently does) and we still want to surface "BTC is
+// configured but disabled" rather than falling through to the
+// default driver.
 func (s *Service) driverForAsset(asset string) Driver {
 	if s.registry != nil {
 		if drv, ok := s.registry.GetForAsset(asset); ok {
 			return drv
+		}
+		// The asset is not in any registered driver. If the
+		// chain for this asset is configured-but-disabled
+		// the registry still has the entry under that
+		// chainID — surface nil so the handler can return a
+		// 503 instead of silently using the default driver.
+		if s.registry.ChainIDForAsset(asset) != "" {
+			return nil
 		}
 	}
 	return s.driver

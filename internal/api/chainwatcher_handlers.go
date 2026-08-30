@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -244,8 +245,16 @@ func listWithdrawalsHandler(d Deps) http.HandlerFunc {
 
 // getDepositAddressHandler handles GET /api/v1/deposit-address/{asset}.
 //
-// Returns the user's deposit address for the asset. If none exists,
-// generates a new one via the chain driver.
+// Error mapping (UAPI-6 audit fix): the underlying chainwatcher
+// service can fail in distinct ways and each maps to a different
+// HTTP status. Returning 500 + the raw pgx / driver error
+// message leaks internal state to the client — we now return
+// generic 4xx / 5xx bodies and log the detail server-side only.
+//
+//	chain not configured for asset       → 404 not found
+//	chain driver exists but disabled     → 503 service unavailable
+//	chain RPC error (timeout, 5xx, etc.)  → 502 bad gateway
+//	anything else (DB, panic, etc.)      → 500 internal error
 func getDepositAddressHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := userIDFromContext(r.Context())
@@ -267,8 +276,39 @@ func getDepositAddressHandler(d Deps) http.HandlerFunc {
 
 		addr, err := d.ChainWatcherSvc.GetDepositAddress(r.Context(), uid, asset)
 		if err != nil {
-			d.Log.Error("get deposit address failed", "error", err)
-			writeError(w, http.StatusInternalServerError, err.Error())
+			// Always log the detail server-side. What we send
+			// to the client depends only on a string match
+			// against well-known driver error shapes, not the
+			// raw error message.
+			d.Log.Error("get deposit address failed",
+				"user_id", uid, "asset", asset, "error", err)
+
+			// Classify by the same strings the chainwatcher
+			// service returns. We deliberately do not match on
+			// the full err.Error() because the message is
+			// operator-facing; only the prefix is stable.
+			msg := err.Error()
+			switch {
+			case strings.HasPrefix(msg, "no driver for asset"):
+				writeError(w, http.StatusNotFound,
+					"deposit addresses not supported for this asset")
+			case strings.HasPrefix(msg, "chain ") && strings.Contains(msg, " disabled"):
+				writeError(w, http.StatusServiceUnavailable,
+					"deposit addresses temporarily unavailable for this asset")
+			case strings.Contains(msg, "rpc error") ||
+				strings.Contains(msg, "connection refused") ||
+				strings.Contains(msg, "context deadline exceeded"):
+				writeError(w, http.StatusBadGateway,
+					"upstream chain rpc error")
+			default:
+				// Catch-all 5xx — never expose the raw
+				// message. Same hardening as the v0.2 / v0.3
+				// NEW-H2 audit applied to the regular /api/v1
+				// surface; we mirror it here so the public
+				// user-api surface does not regress.
+				writeError(w, http.StatusInternalServerError,
+					"internal error")
+			}
 			return
 		}
 
