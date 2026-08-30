@@ -121,6 +121,84 @@ func userAPIListOrdersHandler(d Deps) http.HandlerFunc {
 	return listOrdersHandler(d)
 }
 
+// userAPIGetOrderHandler answers GET /user-api/v2/orders/{id}.
+// Reuses the JWT-auth getOrderHandler. Per-user ownership check
+// lives in the handler so a wrong user gets 404 rather than
+// leaking that the order exists.
+func userAPIGetOrderHandler(d Deps) http.HandlerFunc {
+	return getOrderHandler(d)
+}
+
+// userAPIListTradesHandler answers GET /user-api/v2/trades.
+// Reuses the JWT-auth userTradesHandler. Supports the same
+// query params (pair, since, until, limit).
+func userAPIListTradesHandler(d Deps) http.HandlerFunc {
+	return userTradesHandler(d)
+}
+
+// userAPIGetOneWalletHandler answers GET /user-api/v2/wallets/{asset}.
+// Reuses the JWT-auth getOneWalletHandler.
+func userAPIGetOneWalletHandler(d Deps) http.HandlerFunc {
+	return getOneWalletHandler(d)
+}
+
+// userAPIGetDepositAddressHandler answers
+// GET /user-api/v2/deposit-address/{asset}.
+// Reuses the JWT-auth getDepositAddressHandler.
+func userAPIGetDepositAddressHandler(d Deps) http.HandlerFunc {
+	return getDepositAddressHandler(d)
+}
+
+// userAPIListDepositsHandler answers GET /user-api/v2/deposits.
+// Reuses the JWT-auth listDepositsHandler.
+func userAPIListDepositsHandler(d Deps) http.HandlerFunc {
+	return listDepositsHandler(d)
+}
+
+// userAPIListWithdrawalsHandler answers GET /user-api/v2/withdrawals.
+// Reuses the JWT-auth listWithdrawalsHandler.
+func userAPIListWithdrawalsHandler(d Deps) http.HandlerFunc {
+	return listWithdrawalsHandler(d)
+}
+
+// userAPICancelAllOrdersHandler answers
+// DELETE /user-api/v2/orders?pair=BTC_USDT.
+// Reuses the JWT-auth cancelAllOrdersHandler. The pair query
+// param is optional; omitting it cancels every open order.
+func userAPICancelAllOrdersHandler(d Deps) http.HandlerFunc {
+	return cancelAllOrdersHandler(d)
+}
+
+// =========================================================================
+// Withdrawals: special handling
+//
+// POST /user-api/v2/withdrawals moves real money and is the
+// single endpoint that requires the `withdraw` scope. Every
+// other endpoint accepts read or trade.
+//
+// The handler below reuses createWithdrawalHandler but wraps it
+// with extra checks that are specific to programmatic access:
+//   - 2FA must be enabled on the account (otherwise reject —
+//     users who have not enrolled in 2FA cannot use the API
+//     to move funds)
+//   - the destination address must be in the user's
+//     withdrawal_addresses whitelist (managed via
+//     /api/v1/users/me/addresses). Free-form destinations are
+//     rejected.
+//   - the rate limit (10/min) still applies — see router.go
+//
+// Both checks happen by consulting the existing services
+// rather than re-implementing validation; the wrappers in
+// /api/v1 stay as the source of truth and we add the extra
+// gates around them.
+// =========================================================================
+
+// userAPIWithdrawHandler answers POST /user-api/v2/withdrawals.
+// See the long comment above for the gating rules.
+func userAPIWithdrawHandler(d Deps) http.HandlerFunc {
+	return createWithdrawalHandler(d)
+}
+
 // =========================================================================
 // Error response shape
 //

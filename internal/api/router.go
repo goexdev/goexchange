@@ -148,7 +148,19 @@ func NewRouter(d Deps) http.Handler {
 
 			r.With(requireScope(ScopeTrade)).Post("/orders", userAPIPlaceOrderHandler(d))
 			r.With(requireScope(ScopeTrade)).Delete("/orders/{id}", userAPIcancelOrderHandler(d))
+			r.With(requireScope(ScopeTrade)).Delete("/orders", userAPICancelAllOrdersHandler(d))
 			r.With(requireScope(ScopeRead)).Get("/orders", userAPIListOrdersHandler(d))
+			r.With(requireScope(ScopeRead)).Get("/orders/{id}", userAPIGetOrderHandler(d))
+
+			r.With(requireScope(ScopeRead)).Get("/trades", userAPIListTradesHandler(d))
+
+			r.With(requireScope(ScopeRead)).Get("/wallets/{asset}", userAPIGetOneWalletHandler(d))
+
+			r.With(requireScope(ScopeRead)).Get("/deposit-address/{asset}", userAPIGetDepositAddressHandler(d))
+			r.With(requireScope(ScopeRead)).Get("/deposits", userAPIListDepositsHandler(d))
+
+			r.With(requireScope(ScopeRead)).Get("/withdrawals", userAPIListWithdrawalsHandler(d))
+			r.With(requireScope(ScopeWithdraw)).Post("/withdrawals", userAPIWithdrawHandler(d))
 		})
 	})
 
