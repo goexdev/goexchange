@@ -75,6 +75,16 @@ func NewRouter(d Deps) http.Handler {
 	favoritesLimiter := NewRateLimiter(50, time.Minute)    // 50 fav ops/min per user
 	_ = withdrawLimiter                                       // reserved for future withdraw endpoint
 
+	// Per-api-key rate limit applied to every /user-api/v2
+	// request (public + private). Private endpoints bucket by
+	// api_key.KeyID; public endpoints bucket by client IP via
+	// the apiKeyKeyFromContext fallback. 60/min matches the
+	// existing orderLimiter ceiling and is permissive enough
+	// for monitoring scripts while still capping brute force
+	// scans of the public market data surface.
+	userAPIKeyLimiter := NewAPIKeyRateLimiter(60, time.Minute)
+	_ = userAPIKeyLimiter
+
 	// Middleware
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -125,24 +135,49 @@ func NewRouter(d Deps) http.Handler {
 	// monotonicity per key. See apikey_middleware.go.
 	// =========================================================================
 	r.Route("/user-api/v2", func(r chi.Router) {
-		// Public endpoints — no api key required, no rate limit
-		// beyond the implicit infra (nginx already enforces a
-		// reasonable ceiling). These mirror the public market data
-		// endpoints under /api/v1 so script authors only have to
-		// learn one URL shape.
-		r.Get("/ping", userAPIPingHandler(d))
-		r.Get("/server-time", userAPIServerTimeHandler(d))
-		r.Get("/markets", userAPIListMarketsHandler(d))
-		r.Get("/markets/{base}/{quote}/ticker", userAPIMarketTickerHandler(d))
-		r.Get("/markets/{base}/{quote}/orderbook", userAPIMarketOrderBookHandler(d))
-		r.Get("/markets/{base}/{quote}/trades", userAPIMarketRecentTradesHandler(d))
-		r.Get("/currencies", userAPIListCurrenciesHandler(d))
+		// Rate limiter applies to BOTH public and private endpoints
+		// under /user-api/v2. The limiter pulls its bucket key
+		// from the request context (api_key.KeyID for authed, client
+		// IP for public). For public endpoints we wrap each route
+		// with a tiny shim middleware that writes the IP into the
+		// context before the limiter reads it — that keeps the
+		// public endpoints from having to know about the limiter
+		// at all.
+		limitByAPIKey := userAPIKeyLimiter.Middleware
+		publicIP := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// For public endpoints write the resolved IP
+				// into the context so the limiter below uses
+				// the same key the authenticated path would.
+				// apiKeyKeyFromContext prefers the leftmost
+				// X-Forwarded-For entry, then X-Real-IP, then
+				// RemoteAddr — see its doc for the rationale.
+				ctx := contextWithAPIKeyKey(r.Context(), apiKeyKeyFromContext(r))
+				next.ServeHTTP(w, r.WithContext(ctx))
+			})
+		}
+
+		// Public endpoints — no api key required, but still rate
+		// limited per client IP. These mirror the public market
+		// data endpoints under /api/v1 so script authors only
+		// have to learn one URL shape.
+		r.With(publicIP).Group(func(r chi.Router) {
+			r.Use(limitByAPIKey)
+			r.Get("/ping", userAPIPingHandler(d))
+			r.Get("/server-time", userAPIServerTimeHandler(d))
+			r.Get("/markets", userAPIListMarketsHandler(d))
+			r.Get("/markets/{base}/{quote}/ticker", userAPIMarketTickerHandler(d))
+			r.Get("/markets/{base}/{quote}/orderbook", userAPIMarketOrderBookHandler(d))
+			r.Get("/markets/{base}/{quote}/trades", userAPIMarketRecentTradesHandler(d))
+			r.Get("/currencies", userAPIListCurrenciesHandler(d))
+		})
 
 		// Private endpoints — require api key auth. The
 		// middleware puts user_id + scopes in context; handlers
 		// that need scope enforcement wrap with requireScope.
 		r.Group(func(r chi.Router) {
 			r.Use(userAPIKeyAuth(d.APIKeys))
+			r.Use(limitByAPIKey)
 
 			r.Get("/balances", userAPIListBalancesHandler(d))
 

@@ -57,6 +57,7 @@ func userAPIKeyAuth(svc *apikeys.Service) func(http.Handler) http.Handler {
 			ctx := r.Context()
 			ctx = withUserID(ctx, res.Key.UserID.String())
 			ctx = contextWithScopes(ctx, res.Scopes)
+			ctx = contextWithAPIKeyKey(ctx, res.Key.KeyID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -65,6 +66,65 @@ func userAPIKeyAuth(svc *apikeys.Service) func(http.Handler) http.Handler {
 // scopesContextKey is a private key type so callers cannot
 // accidentally collide with another context value.
 type scopesContextKey struct{}
+
+// apiKeyKeyContextKey is used by the api-key rate limiter. It
+// stores either the verified api_key.KeyID (for authenticated
+// requests) or the client IP (for public endpoints that never
+// pass through userAPIKeyAuth). The middleware picks the right
+// one — see apiKeyKeyFromContext below.
+type apiKeyKeyContextKey struct{}
+
+// contextWithAPIKeyKey stores the api-key rate-limit bucket key.
+// Called from userAPIKeyAuth for authenticated requests, and
+// from a small public-endpoint shim (see router.go) for
+// unauthenticated ones.
+func contextWithAPIKeyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, apiKeyKeyContextKey{}, key)
+}
+
+// apiKeyKeyFromContext returns the bucket key for the api-key
+// rate limiter. If the request did not pass through
+// userAPIKeyAuth (public endpoint), falls back to the client
+// IP so the limiter still has something to count against.
+//
+// IP resolution order (leftmost wins):
+//
+//   1. X-Forwarded-For leftmost entry — this is the *original*
+//      client per RFC 7239 + nginx convention ($proxy_add_x…
+//      appends). When cloudflare or another CDN is in front
+//      it appends the edge IP at the right, so the leftmost
+//      entry stays the true client. This is the only header
+//      that survives proxy rewrites.
+//
+//   2. X-Real-IP. nginx sets this to $remote_addr (= the
+//      immediate peer), so when cloudflare is in front this
+//      value is the cloudflare edge IP. We use it as a
+//      fallback when X-Forwarded-For is missing.
+//
+//   3. RemoteAddr. Same caveat as X-Real-IP, used as a last
+//      resort.
+//
+// Note that we deliberately do NOT trust client-supplied
+// X-Real-IP because nginx's proxy_set_header X-Real-IP
+// $remote_addr rewrites it. Trusting it would let an attacker
+// bypass the limiter by sending X-Real-IP: random-per-request.
+func apiKeyKeyFromContext(r *http.Request) string {
+	if v, ok := r.Context().Value(apiKeyKeyContextKey{}).(string); ok && v != "" {
+		return v
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i >= 0 {
+			xff = xff[:i]
+		}
+		if ip := strings.TrimSpace(xff); ip != "" {
+			return ip
+		}
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	return IPFromRequest(r)
+}
 
 // contextWithScopes stores the api key's verified scopes in
 // the request context. Handlers that need to check scope reach
