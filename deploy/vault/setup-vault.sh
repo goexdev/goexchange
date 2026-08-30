@@ -31,6 +31,25 @@ vault secrets list 2>/dev/null | grep -q "^secret/" || {
     vault secrets enable -path=secret kv-v2
 }
 
+# Enable audit log to file (idempotent). The host bind-mount
+# ./deploy/vault/audit must exist for this to work; the deploy
+# script creates the directory.
+#
+# Audit records every request and response, including token
+# issuance, secret reads, and policy checks. This is required for
+# SOC2 / PCI-DSS / GDPR compliance. Without it, vault operates
+# silently and a leaked token goes undetected.
+if ! vault audit list 2>/dev/null | grep -q "^file/"; then
+    echo "==> Enabling file audit device at /vault/audit/audit.log"
+    # Ensure the audit directory exists inside the container.
+    # We write to /vault/audit because that's the bind-mount
+    # target from compose.yml; the host path is
+    # ./deploy/vault/audit.
+    if ! vault audit enable -path=file file file_path=/vault/audit/audit.log 2>/dev/null; then
+        echo "WARN: failed to enable audit device (continuing — non-fatal for dev)"
+    fi
+fi
+
 # DB credentials (CHANGE THESE IN PRODUCTION!)
 echo "==> Storing DB credentials..."
 vault kv put secret/db/postgres \
@@ -173,13 +192,20 @@ if [ "${SKIP_APPROLE:-false}" != "true" ]; then
         vault auth enable approle
     fi
 
-    # Create role with read-only policy
+    # Create role with read-only policy.
+    # secret_id_num_uses=0 means unlimited uses per secret_id (a
+    # secret_id's lifetime is then capped only by secret_id_ttl,
+    # which is the next knob). The previous default of 100 was
+    # too low — a single API startup that loads DB + JWT + HD
+    # mnemonic + hot-wallet secrets consumes ~4 uses, and the
+    # 5-minute Vault cache + frequent key reads burn through the
+    # remaining budget in a few hours.
     vault write auth/approle/role/goexchange \
         token_policies="goexchange" \
         token_ttl=1h \
         token_max_ttl=24h \
         secret_id_ttl=24h \
-        secret_id_num_uses=100
+        secret_id_num_uses=0
 
     # Get role-id (stable)
     ROLE_ID=$(vault read -field=role_id auth/approle/role/goexchange/role-id)

@@ -52,9 +52,10 @@ services:
       timeout: 3s
       retries: 5
 
-  # HashiCorp Vault in dev mode. DO NOT use this in production;
-  # point VAULT_ADDR at a real Vault cluster instead and disable
-  # this service.
+  # HashiCorp Vault. For local dev we run a single-node dev
+  # server. To exercise HA / Raft locally, override with
+  # `docker compose -f compose.yml -f compose.ha.yml up` (see
+  # compose.ha.yml).
   vault:
     image: hashicorp/vault:1.15
     container_name: goexchange-vault
@@ -66,6 +67,11 @@ services:
       - IPC_LOCK
     ports:
       - "8200:8200"
+    volumes:
+      # Bind-mount the audit log directory so it survives
+      # container restarts. Dev mode does not persist KV data,
+      # but the audit trail should be durable for compliance.
+      - ./deploy/vault/audit:/vault/audit
     healthcheck:
       test: ["CMD", "vault", "status"]
       interval: 5s
