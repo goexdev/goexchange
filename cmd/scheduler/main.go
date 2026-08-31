@@ -25,6 +25,7 @@ import (
 	"github.com/goexdev/goexchange/internal/migrate"
 	"github.com/goexdev/goexchange/internal/notifier"
 	"github.com/goexdev/goexchange/internal/user"
+	"github.com/goexdev/goexchange/internal/vaultinit"
 	"github.com/goexdev/goexchange/internal/wallet"
 )
 
@@ -46,6 +47,20 @@ func run() error {
 
 	log := logger.New(cfg.App.Env)
 	log.Info("starting goexchange-scheduler", "env", cfg.App.Env, "port", cfg.App.SchedulerPort)
+
+	// Initialize vault first so the scheduler picks up the same
+	// DB password (and JWT secret, etc.) as the API binary.
+	// Without this step the scheduler would try to connect with
+	// the dev placeholder password and fail with
+	// "password authentication failed for user exchange".
+	if cfg.Vault.Enabled {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := vaultinit.Init(cfg, initCtx, log)
+		initCancel()
+		if err != nil {
+			return fmt.Errorf("init vault: %w", err)
+		}
+	}
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer initCancel()

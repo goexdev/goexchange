@@ -40,6 +40,7 @@ import (
 	"github.com/goexdev/goexchange/internal/analytics"
 	"github.com/goexdev/goexchange/internal/uploads"
 	"github.com/goexdev/goexchange/internal/vault"
+	"github.com/goexdev/goexchange/internal/vaultinit"
 	"github.com/goexdev/goexchange/internal/wallet"
 )
 
@@ -137,6 +138,10 @@ func buildChainDrivers(cfg config.ChainWatcherConfig, vaultCfg config.VaultConfi
 
 // initVault initializes the Vault client and overrides config with secrets.
 // Returns nil if disabled or unavailable (with warning).
+//
+// This is a copy of the same helper in cmd/api/main.go, kept
+// here because the scheduler is a separate binary and does not
+// link against api. They diverge only in logging context.
 func initVault(cfg *config.Config, ctx context.Context, log *slog.Logger) (*vault.Client, error) {
 	if !cfg.Vault.Enabled {
 		log.Info("vault disabled, using config.yaml for all secrets")
@@ -295,8 +300,11 @@ func run() error {
 	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer initCancel()
 
-	// Initialize Vault client (if enabled) and load secrets
-	vaultClient, err := initVault(cfg, initCtx, log)
+	// Initialize Vault client (if enabled) and load secrets.
+	// The scheduler binary uses the same helper from
+	// internal/vaultinit so both binaries share the same
+	// secret-loading logic and there is no copy drift.
+	vaultClient, err := vaultinit.Init(cfg, initCtx, log)
 	if err != nil {
 		return fmt.Errorf("init vault: %w", err)
 	}
