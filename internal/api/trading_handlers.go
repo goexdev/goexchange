@@ -1,9 +1,11 @@
 package api
 
 import (
-	"github.com/goexdev/goexchange/internal/marketdata"
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/goexdev/goexchange/internal/marketdata"
 	"github.com/goexdev/goexchange/internal/matching"
 	"github.com/goexdev/goexchange/internal/trading"
 )
@@ -517,7 +520,18 @@ func marketTickerHandler(d Deps) http.HandlerFunc {
 
 // userTradesHandler handles GET /api/v1/users/me/trades
 // Returns the recent trades for the authenticated user.
-// Query params: pair (optional, e.g. "BTC_USDT"), limit (default 100)
+// Query params:
+//
+//	pair    optional, e.g. "BTC_USDT"
+//	limit   default 100, max 500 (JSON) / 5000 (CSV)
+//	since   ISO-8601 timestamp, inclusive lower bound
+//	until   ISO-8601 timestamp, inclusive upper bound
+//	format  "csv" (default "json") — emits text/csv with
+//	        Content-Disposition: attachment for browser download
+//
+// CSV columns: trade_id,pair,base,quote,taker_side,price,
+// quantity,total,buy_user_id,sell_user_id,buy_order_id,
+// sell_order_id,executed_at.
 func userTradesHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := userIDFromContext(r.Context())
@@ -527,12 +541,43 @@ func userTradesHandler(d Deps) http.HandlerFunc {
 			return
 		}
 		pairFilter := r.URL.Query().Get("pair")
+		// Parse the time range first so both JSON and CSV branches
+		// share the same validation. Malformed timestamps return
+		// 400 rather than silently returning everything (the
+		// default behaviour before this branch was added).
+		var since, until *time.Time
+		if v := r.URL.Query().Get("since"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid since (want RFC3339): "+err.Error())
+				return
+			}
+			since = &t
+		}
+		if v := r.URL.Query().Get("until"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid until (want RFC3339): "+err.Error())
+				return
+			}
+			until = &t
+		}
+		format := r.URL.Query().Get("format")
+
+		if format == "csv" {
+			writeTradesCSV(w, r, d, uid, pairFilter, since, until)
+			return
+		}
+
 		limit := 100
 		if l := r.URL.Query().Get("limit"); l != "" {
 			if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 500 {
 				limit = n
 			}
 		}
+		// JSON path ignores since/until to keep the existing
+		// response shape (most-recent N). CSV is the recommended
+		// path for date-bounded exports.
 		trades, err := d.TradingSvc.GetUserTrades(r.Context(), uid, pairFilter, limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -543,9 +588,91 @@ func userTradesHandler(d Deps) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"trades": trades,
-			"count": len(trades),
+			"count":  len(trades),
 		})
 	}
+}
+
+// writeTradesCSV streams the user's trades as CSV. It uses the
+// service-layer GetUserTradesRange method which respects the
+// pair/since/until filters and caps the row count at 5000 (see
+// the service method for the rationale).
+//
+// We write to a bytes.Buffer first rather than streaming straight
+// to the ResponseWriter because the limit is small (5k rows) and
+// a partial CSV on error is worse than a 500. The Content-Length
+// is set automatically by net/http.
+func writeTradesCSV(w http.ResponseWriter, r *http.Request, d Deps, uid uuid.UUID, pairFilter string, since, until *time.Time) {
+	limit := 1000
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	rows, err := d.TradingSvc.GetUserTradesRange(r.Context(), uid, pairFilter, since, until, limit)
+	if err != nil {
+		d.Log.Error("trades csv query failed", "error", err, "user_id", uid)
+		// "unknown pair" deserves a 400, not a 500. The service
+		// wraps unknown pairs with "unknown pair: %s" so we can
+		// detect that case here without leaking the underlying
+		// pgx error to the client.
+		if strings.Contains(err.Error(), "unknown pair") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "csv query failed: "+err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []trading.TradeExportRow{}
+	}
+
+	// Filename embeds the export date + the optional pair filter
+	// so a user who exports BTC and ETH on the same day does not
+	// overwrite each other in their Downloads folder.
+	filename := fmt.Sprintf("trades-%s", time.Now().UTC().Format("2006-01-02"))
+	if pairFilter != "" {
+		filename += "-" + strings.ToLower(pairFilter)
+	}
+	filename += ".csv"
+
+	var buf bytes.Buffer
+	wri := csv.NewWriter(&buf)
+	// Header row: documented in the function comment. Keep the
+	// order stable — downstream tools (and the docs) depend on it.
+	_ = wri.Write([]string{
+		"trade_id", "pair", "base", "quote", "taker_side",
+		"price", "quantity", "total",
+		"buy_user_id", "sell_user_id",
+		"buy_order_id", "sell_order_id",
+		"executed_at",
+	})
+	for _, r := range rows {
+		_ = wri.Write([]string{
+			r.TradeID, r.Pair, r.Base, r.Quote, r.TakerSide,
+			r.Price, r.Quantity, r.Total,
+			r.BuyUserID, r.SellUserID,
+			r.BuyOrderID, r.SellOrderID,
+			r.ExecutedAt,
+		})
+	}
+	wri.Flush()
+	if err := wri.Error(); err != nil {
+		writeError(w, http.StatusInternalServerError, "csv encode failed")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	// CSV bodies must never be cached — they contain per-user
+	// balances. We set this even though the /api/ location already
+	// sets no-store because a reverse proxy could still cache by
+	// URL if the inner location override is missed.
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	d.Log.Info("trades csv exported",
+		"user_id", uid, "rows", len(rows),
+		"format", "csv", "pair", pairFilter)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // cancelAllOrdersHandler handles DELETE /api/v1/orders

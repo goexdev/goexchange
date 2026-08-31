@@ -431,6 +431,134 @@ func (s *Service) GetUserTrades(ctx context.Context, userID uuid.UUID, pairFilte
 	return out, nil
 }
 
+// TradeExportRow is the flat shape used for CSV export. We keep it
+// separate from UserTrade (which carries nested Side/CounterSide
+// derived per-user) so the CSV columns are stable regardless of
+// which side the requesting user was on. Both columns are
+// exported so downstream tools (accounting, tax) can reconcile
+// the buy and sell legs of the same trade.
+type TradeExportRow struct {
+	TradeID     string
+	Pair        string
+	Base        string
+	Quote       string
+	TakerSide   string // "BUY" or "SELL" from the matcher's view
+	Price       string
+	Quantity    string
+	Total       string // price * quantity
+	BuyUserID   string
+	SellUserID  string
+	BuyOrderID  string
+	SellOrderID string
+	ExecutedAt  string
+}
+
+// GetUserTradesRange returns the user's trades between since and
+// until (inclusive). All three filters are optional; with none
+// set, it behaves like GetUserTrades.
+//
+// The limit defaults to 1000 and is capped at 5000 — larger
+// exports should be done via a background job, not a synchronous
+// HTTP request. CSV clients can page by adjusting since/until.
+func (s *Service) GetUserTradesRange(ctx context.Context, userID uuid.UUID, pairFilter string, since, until *time.Time, limit int) ([]TradeExportRow, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+
+	// Build the WHERE clause incrementally so the placeholder
+	// numbering stays clean. ORDER BY and LIMIT stay outside the
+	// joined predicate so we don't accidentally "AND" them with
+	// the WHERE clauses.
+	conds := []string{"(o_buy.user_id = $1 OR o_sell.user_id = $1)"}
+	args := []interface{}{userID}
+	idx := 2
+	if pairFilter != "" {
+		parts := strings.SplitN(pairFilter, "_", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid pair %q (want BASE_QUOTE)", pairFilter)
+		}
+		var pairID int
+		if err := s.pool.QueryRow(ctx,
+			`SELECT id FROM trading_pairs WHERE base = $1 AND quote = $2`,
+			strings.ToUpper(parts[0]), strings.ToUpper(parts[1]),
+		).Scan(&pairID); err != nil {
+			return nil, fmt.Errorf("unknown pair: %s: %w", pairFilter, err)
+		}
+		conds = append(conds, fmt.Sprintf("t.pair_id = $%d", idx))
+		args = append(args, pairID)
+		idx++
+	}
+	if since != nil {
+		conds = append(conds, fmt.Sprintf("t.executed_at >= $%d", idx))
+		args = append(args, *since)
+		idx++
+	}
+	if until != nil {
+		conds = append(conds, fmt.Sprintf("t.executed_at <= $%d", idx))
+		args = append(args, *until)
+		idx++
+	}
+	args = append(args, limit)
+	limitPlaceholder := fmt.Sprintf("$%d", idx)
+
+	var qb strings.Builder
+	qb.WriteString(`SELECT t.id, tp.base, tp.quote, t.price, t.quantity, t.taker_side,
+	                       t.buy_order_id, t.sell_order_id, t.executed_at,
+	                       o_buy.user_id, o_sell.user_id
+	                 FROM trades t
+	                 JOIN trading_pairs tp ON t.pair_id = tp.id
+	                 JOIN orders o_buy ON o_buy.id = t.buy_order_id
+	                 JOIN orders o_sell ON o_sell.id = t.sell_order_id
+	                 WHERE `)
+	qb.WriteString(strings.Join(conds, " AND "))
+	qb.WriteString(" ORDER BY t.executed_at DESC LIMIT ")
+	qb.WriteString(limitPlaceholder)
+
+	rows, err := s.pool.Query(ctx, qb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []TradeExportRow{}
+	for rows.Next() {
+		var r TradeExportRow
+		var id uuid.UUID
+		var price, quantity float64
+		var executedAt time.Time
+		var buyOrderID, sellOrderID string
+		var takerSide string
+		var base, quote string
+		var buyUserID, sellUserID uuid.UUID
+		if err := rows.Scan(&id, &base, &quote, &price, &quantity, &takerSide, &buyOrderID, &sellOrderID, &executedAt, &buyUserID, &sellUserID); err != nil {
+			return nil, err
+		}
+		r.TradeID = id.String()
+		r.Pair = base + "_" + quote
+		r.Base = base
+		r.Quote = quote
+		r.TakerSide = takerSide
+		// Decimal math for the total so the CSV carries an exact
+		// product (floating-point rounding would corrupt sums that
+		// users do in spreadsheets).
+		pDec := decimal.NewFromFloat(price)
+		qDec := decimal.NewFromFloat(quantity)
+		r.Price = pDec.String()
+		r.Quantity = qDec.String()
+		r.Total = pDec.Mul(qDec).String()
+		r.BuyUserID = buyUserID.String()
+		r.SellUserID = sellUserID.String()
+		r.BuyOrderID = buyOrderID
+		r.SellOrderID = sellOrderID
+		r.ExecutedAt = executedAt.UTC().Format(time.RFC3339Nano)
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // Get24hStats returns 24-hour market statistics for a pair.
 func (s *Service) Get24hStats(ctx context.Context, base, quote string) (*Market24hStats, error) {
 	// Look up pair_id
