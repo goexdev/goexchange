@@ -489,7 +489,22 @@ func adminTogglePairHandler(d Deps) http.HandlerFunc {
 	}
 }
 
-// marketOrderBookHandler handles GET /api/v1/markets/{base}/{quote}/orderbook.
+// pairEnabledGate returns true when (base, quote) is in the
+// MarketDataSvc's pair cache AND its Enabled flag is true. The
+// TradingSvc has its own cached pair list (loaded from DB at
+// start-up, only enabled=true); a pair that is disabled is
+// simply absent from that cache, so TradingSvc-based handlers
+// already return 404 ErrUnknownPair. The MarketDataSvc cache
+// keeps every pair (including disabled ones, so admin tools can
+// still see their config) which is why we need this extra check
+// for the ticker / orderbook / candles / stats endpoints.
+func pairEnabledGate(d Deps, base, quote string) bool {
+	p, ok := d.MarketDataSvc.GetPair(base, quote)
+	if !ok {
+		return false
+	}
+	return p.Enabled
+}
 func marketOrderBookHandler(d Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		base := chi.URLParam(r, "base")
@@ -499,7 +514,11 @@ func marketOrderBookHandler(d Deps) http.HandlerFunc {
 			return
 		}
 		depth := 20 // default
-		snap, _ := d.MarketDataSvc.GetOrderBook(r.Context(), strings.ToUpper(base), strings.ToUpper(quote), depth)
+		snap, err := d.MarketDataSvc.GetOrderBook(r.Context(), strings.ToUpper(base), strings.ToUpper(quote), depth)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "pair not found")
+			return
+		}
 		writeJSON(w, http.StatusOK, snap)
 	}
 }
@@ -513,7 +532,15 @@ func marketTickerHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing base or quote")
 			return
 		}
-		t, _ := d.MarketDataSvc.GetTicker(r.Context(), strings.ToUpper(base), strings.ToUpper(quote))
+		t, err := d.MarketDataSvc.GetTicker(r.Context(), strings.ToUpper(base), strings.ToUpper(quote))
+		if err != nil {
+			// Disabled and unknown pairs both surface as 404 —
+			// we deliberately do NOT differentiate because telling
+			// a client "this pair is disabled" leaks the pair's
+			// existence in the config.
+			writeError(w, http.StatusNotFound, "pair not found")
+			return
+		}
 		writeJSON(w, http.StatusOK, t)
 	}
 }
@@ -710,7 +737,13 @@ func market24hStatsHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing base or quote")
 			return
 		}
-		stats, err := d.TradingSvc.Get24hStats(r.Context(), strings.ToUpper(base), strings.ToUpper(quote))
+		base = strings.ToUpper(base)
+		quote = strings.ToUpper(quote)
+		if !pairEnabledGate(d, base, quote) {
+			writeError(w, http.StatusNotFound, "pair not found")
+			return
+		}
+		stats, err := d.TradingSvc.Get24hStats(r.Context(), base, quote)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -729,13 +762,19 @@ func marketRecentTradesHandler(d Deps) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing base or quote")
 			return
 		}
+		base = strings.ToUpper(base)
+		quote = strings.ToUpper(quote)
+		if !pairEnabledGate(d, base, quote) {
+			writeError(w, http.StatusNotFound, "pair not found")
+			return
+		}
 		limit := 50
 		if l := r.URL.Query().Get("limit"); l != "" {
 			if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
 				limit = n
 			}
 		}
-		trades, err := d.TradingSvc.GetRecentTrades(r.Context(), strings.ToUpper(base), strings.ToUpper(quote), limit)
+		trades, err := d.TradingSvc.GetRecentTrades(r.Context(), base, quote, limit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -745,7 +784,7 @@ func marketRecentTradesHandler(d Deps) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"trades": trades,
-			"pair":   strings.ToUpper(base) + "_" + strings.ToUpper(quote),
+			"pair":   base + "_" + quote,
 		})
 	}
 }
@@ -760,6 +799,12 @@ func marketCandlesHandler(d Deps) http.HandlerFunc {
 		quote := chi.URLParam(r, "quote")
 		if base == "" || quote == "" {
 			writeError(w, http.StatusBadRequest, "missing base or quote")
+			return
+		}
+		base = strings.ToUpper(base)
+		quote = strings.ToUpper(quote)
+		if !pairEnabledGate(d, base, quote) {
+			writeError(w, http.StatusNotFound, "pair not found")
 			return
 		}
 		interval := 300 // default 5m
@@ -779,7 +824,7 @@ func marketCandlesHandler(d Deps) http.HandlerFunc {
 				toMs = n
 			}
 		}
-		candles, err := d.TradingSvc.GetCandles(r.Context(), strings.ToUpper(base), strings.ToUpper(quote), interval, fromMs, toMs)
+		candles, err := d.TradingSvc.GetCandles(r.Context(), base, quote, interval, fromMs, toMs)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

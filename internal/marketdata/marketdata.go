@@ -2,6 +2,7 @@ package marketdata
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -15,6 +16,12 @@ type DataSource interface {
 	GetOrderBook(ctx context.Context, base, quote string, depth int) (bids, asks []OrderBookLevel, err error)
 	GetTicker(ctx context.Context, base, quote string) (bid, ask string, err error)
 }
+
+// ErrPairDisabled is returned by GetTicker / GetOrderBook when
+// the pair exists in config but enabled=false. The HTTP handler
+// maps it to 404 so disabled pairs do not leak cached price data
+// to clients polling old endpoints.
+var ErrPairDisabled = errors.New("pair disabled")
 
 // OrderBookLevel is one price/qty in the order book.
 type OrderBookLevel struct {
@@ -182,8 +189,14 @@ type Ticker struct {
 	Last string `json:"last"`
 }
 
-// GetTicker returns ticker for a market.
+// GetTicker returns ticker for a market. Returns ErrPairDisabled
+// (or ErrUnknownPair) when the pair is not in the enabled list,
+// which the HTTP handler maps to 404 so disabled pairs do not
+// leak cached price data.
 func (s *Service) GetTicker(ctx context.Context, base, quote string) (*Ticker, error) {
+	if !s.pairEnabled(base, quote) {
+		return nil, ErrPairDisabled
+	}
 	bid, ask, err := s.src.GetTicker(ctx, base, quote)
 	if err != nil {
 		return nil, err
@@ -196,8 +209,12 @@ func (s *Service) GetTicker(ctx context.Context, base, quote string) (*Ticker, e
 	}, nil
 }
 
-// GetOrderBook returns the order book for a pair.
+// GetOrderBook returns the order book for a pair. Same
+// enabled-only gate as GetTicker.
 func (s *Service) GetOrderBook(ctx context.Context, base, quote string, depth int) (*OrderBook, error) {
+	if !s.pairEnabled(base, quote) {
+		return nil, ErrPairDisabled
+	}
 	bids, asks, err := s.src.GetOrderBook(ctx, base, quote, depth)
 	if err != nil {
 		return nil, err
@@ -208,6 +225,21 @@ func (s *Service) GetOrderBook(ctx context.Context, base, quote string, depth in
 		Asks: asks,
 		Time: time.Now(),
 	}, nil
+}
+
+// pairEnabled returns true when the (base, quote) pair exists in
+// the loaded config and is enabled. Used as a gate on every
+// public data endpoint so a disabled pair disappears from the
+// UI immediately on restart.
+func (s *Service) pairEnabled(base, quote string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.pairs {
+		if p.Base == base && p.Quote == quote {
+			return p.Enabled
+		}
+	}
+	return false
 }
 
 // (GetRecentTrades and GetCandles are handled by TradingSvc, not MarketDataSvc)
