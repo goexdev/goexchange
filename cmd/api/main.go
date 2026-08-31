@@ -487,6 +487,13 @@ func run() error {
 	}
 	go evmIndexer.Run(ctxBg, 30*time.Second)
 
+	// Start notifier outbox worker. Picks up rows inserted via
+	// notifier.Send / SendHTML and dispatches them through the
+	// configured provider (Resend in prod, console/smtp in dev).
+	// Without this goroutine the outbox accumulates PENDING rows
+	// forever — that is a real bug, see commit history.
+	go notifierSvc.RunWorker(ctxBg, 15*time.Second)
+
 	// Start config file watcher for hot-reload.
 	// When config.yaml changes, debounced re-read + apply to registry.
 	configWatcher := config.NewWatcher("config.yaml", log, func(newCfg *config.Config) error {

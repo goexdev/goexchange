@@ -331,15 +331,15 @@ scheduler:
 
 
 notifier:
-  worker_interval_sec: 30
-  provider: "smtp"
+  worker_interval_sec: 15
+  provider: "resend"
   smtp:
     host: "127.0.0.1"
     port: 1025
     user: ""
     password: ""
-    from: "noreply@goexchange.local"
+    from: "noreply@goexchange.top"
   resend:
-    api_key: ""
-    from: "noreply@goexchange.local"
-  from: "noreply@goexchange.local"
+    api_key: ""    # set RESEND_API_KEY in .env; vault can also seed secret/notifier/resend
+    from: "noreply@goexchange.top"
+  from: "noreply@goexchange.top"

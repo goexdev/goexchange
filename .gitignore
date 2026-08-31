@@ -58,4 +58,4 @@ Dockerfile.bak
 # Adding new files here is intentionally allowed so devs can keep their
 # own notes; the rule below prevents them from being committed.
 docs/
-docs/**/
+docs/**/.env.bak.*
