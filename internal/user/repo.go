@@ -53,14 +53,14 @@ func (r *Repo) FindByEmail(ctx context.Context, email string) (*User, error) {
 		SELECT id, email, password_hash, kyc_level, kyc_status,
 		       kyc_submitted_at, kyc_approved_at,
 		       COALESCE(kyc_rejected_reason, '') as kyc_rejected_reason,
-		       role, created_at, updated_at
+		       role, email_verified, created_at, updated_at
 		FROM users WHERE email = $1
 	`
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, email).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.KycLevel, &u.KycStatus,
 		&u.KycSubmittedAt, &u.KycApprovedAt, &u.KycRejectedReason,
-		&u.Role, &u.CreatedAt, &u.UpdatedAt,
+		&u.Role, &u.EmailVerified, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
@@ -77,14 +77,14 @@ func (r *Repo) FindByID(ctx context.Context, id uuid.UUID) (*User, error) {
 		SELECT id, email, password_hash, kyc_level, kyc_status,
 		       kyc_submitted_at, kyc_approved_at,
 		       COALESCE(kyc_rejected_reason, '') as kyc_rejected_reason,
-		       role, created_at, updated_at
+		       role, email_verified, created_at, updated_at
 		FROM users WHERE id = $1
 	`
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, id).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.KycLevel, &u.KycStatus,
 		&u.KycSubmittedAt, &u.KycApprovedAt, &u.KycRejectedReason,
-		&u.Role, &u.CreatedAt, &u.UpdatedAt,
+		&u.Role, &u.EmailVerified, &u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound

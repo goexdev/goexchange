@@ -1,0 +1,24 @@
+{
+  "verify_email": {
+    "subject": "Verify your goexchange email",
+    "title": "Welcome to goexchange",
+    "greeting": "Hi {{Email}}",
+    "intro": "Thanks for signing up. To finish creating your account and start trading, please confirm this email address.",
+    "button": "Verify email",
+    "fallback": "If the button above does not work, paste this link into your browser:",
+    "expiry": "This link expires in {{TTL}} minutes.",
+    "ignore": "If you did not create an account, you can safely ignore this email.",
+    "footer": "goexchange - small exchange, real markets."
+  },
+  "reset_password": {
+    "subject": "Reset your goexchange password",
+    "title": "Reset your password",
+    "greeting": "Hi {{Email}}",
+    "intro": "We received a request to reset the password for your account. If you made this request, click the button below to set a new password.",
+    "button": "Reset password",
+    "fallback": "If the button above does not work, paste this link into your browser:",
+    "expiry": "This link expires in {{TTL}} minutes.",
+    "ignore": "If you did not request a reset, you can safely ignore this email. Your password will not be changed.",
+    "footer": "goexchange - small exchange, real markets."
+  }
+}

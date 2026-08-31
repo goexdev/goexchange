@@ -20,6 +20,7 @@ type User struct {
 	KycApprovedAt   *time.Time
 	KycRejectedReason string
 	Role           string // "user" or "admin"
+	EmailVerified bool   // gates login (must be true to issue JWT)
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }

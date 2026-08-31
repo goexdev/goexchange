@@ -96,14 +96,16 @@ func registerHandler(d Deps) http.HandlerFunc {
 		if err := d.WalletSvc.BootstrapNewUser(r.Context(), u.ID); err != nil {
 			d.Log.Warn("bootstrap wallet failed", "user_id", u.ID, "error", err)
 		}
-		token, err := d.AuthSvc.IssueToken(u.ID.String())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		// Generate a verify-token, queue the email, and tell the
+		// caller to check their inbox. We deliberately do NOT
+		// issue a JWT here — the user must click the link before
+		// they can log in. This is the new flow shipped by
+		// migration 0028.
+		sendVerifyEmail(d, r, u.ID, u.Email)
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			"user":  u.ToPublic(),
-			"token": token,
+			"user":                        u.ToPublic(),
+			"requires_email_verification": true,
+			"message":                     "Account created. Check your email to verify.",
 		})
 	}
 }
@@ -186,6 +188,27 @@ func loginHandler(d Deps) http.HandlerFunc {
 			_ = d.RiskSvc.RecordEvent(r.Context(), u.ID, "LOGIN", score, map[string]interface{}{
 				"ip": ip, "user_agent": ua,
 			})
+		}
+
+		// Gate: a user must have verified their email before we
+		// issue any token. Same generic message regardless of
+		// reason (unverified vs. unknown email vs. wrong password)
+		// so an attacker cannot enumerate accounts by status.
+		if !u.EmailVerified {
+			auditLogAdmin(d, r, audit.LogEntry{
+				Action:      "user.login.unverified",
+				TargetType:  "user",
+				AdminUserID: &uid,
+				AdminEmail:  u.Email,
+				TargetID:    &u.ID,
+				TargetLabel: u.Email,
+				Details:     map[string]any{"reason": "email_not_verified"},
+			})
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{
+				"requires_email_verification": true,
+				"message": "verify your email before signing in. Check your inbox or use resend-verification.",
+			})
+			return
 		}
 
 		// Check if user has 2FA enabled

@@ -69,6 +69,7 @@ func NewRouter(d Deps) http.Handler {
 	// SECURITY: Protect against brute force, spam, and DoS
 	loginLimiter := NewRateLimiter(5, time.Minute)         // 5 logins/min per IP
 	registerLimiter := NewRateLimiter(3, time.Minute)      // 3 registrations/min per IP
+	forgotLimiter := NewRateLimiter(5, time.Minute)        // 5 reset requests/min per IP (anti-enumeration + anti-spam)
 	cancelLimiter := NewRateLimiter(30, time.Minute)       // 30 cancels/min per user
 	withdrawLimiter := NewRateLimiter(10, time.Minute)     // 10 withdrawals/min per user
 	orderLimiter := NewRateLimiter(60, time.Minute)       // 60 orders/min per user
@@ -206,7 +207,15 @@ func NewRouter(d Deps) http.Handler {
 			Post("/users/register", registerHandler(d))
 		r.With(loginLimiter.Middleware(IPFromRequest)).
 			Post("/users/login", loginHandler(d))
-			r.Post("/auth/2fa/complete", totpLoginCompleteHandler(d))  // 2FA login completion
+		r.Post("/auth/2fa/complete", totpLoginCompleteHandler(d))  // 2FA login completion
+
+		// Email verification + password reset (public; no auth needed)
+		r.Get("/auth/verify-email", verifyEmailHandler(d))
+		r.With(forgotLimiter.Middleware(IPFromRequest)).
+			Post("/auth/forgot-password", forgotPasswordHandler(d))
+		r.Post("/auth/reset-password", resetPasswordHandler(d))
+		r.With(forgotLimiter.Middleware(IPFromRequest)).
+			Post("/auth/resend-verification", resendVerificationHandler(d))
 
 		// Public markets (no auth)
 		r.Get("/markets", listMarketsHandler(d))

@@ -97,6 +97,13 @@ func (s *Service) GetUser(ctx context.Context, id uuid.UUID) (*User, error) {
 	return s.repo.FindByID(ctx, id)
 }
 
+// FindUserByEmail is the Service-level wrapper around repo.FindByEmail.
+// It exists so handler code can stay Service-only (the repo is an
+// internal detail). Returns ErrUserNotFound for unknown addresses.
+func (s *Service) FindUserByEmail(ctx context.Context, email string) (*User, error) {
+	return s.repo.FindByEmail(ctx, email)
+}
+
 // UpdateKYCLevel sets a user's KYC level (admin operation).
 func (s *Service) UpdateKYCLevel(ctx context.Context, id uuid.UUID, level int) error {
 	if level < 0 || level > 2 {

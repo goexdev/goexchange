@@ -84,6 +84,29 @@ func (s *Service) Send(ctx context.Context, to, subject, body string) error {
 	return err
 }
 
+// SendHTML queues an email with both a plain-text fallback (body) and
+// an HTML body (html_body). The outbox worker prefers html_body when
+// set, so transactional emails (verify, reset) can be styled without
+// losing the fallback that older clients or strict text-only readers
+// will see.
+//
+// This is the single entry point for the new verify-email and
+// reset-password flows. Subject is taken verbatim; htmlBody and
+// textBody are rendered from internal/notifier/templates.
+func (s *Service) SendHTML(ctx context.Context, to, subject, htmlBody, textBody string) error {
+	if textBody == "" {
+		// The provider will fall back to html_body if no plain body
+		// exists, but Resend requires at least one — set a minimal
+		// placeholder rather than fail the queue.
+		textBody = subject
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO email_outbox (to_email, subject, body, html_body) VALUES ($1, $2, $3, $4)`,
+		to, subject, textBody, htmlBody,
+	)
+	return err
+}
+
 // SendNotification persists an in-app notification and (optionally) queues email.
 // Email is sent only if caller provides an email via SendNotificationWithEmail
 // or if the in-app notification is sent without email preference check.
@@ -209,7 +232,7 @@ func (s *Service) ProcessOutbox(ctx context.Context, batch int) (int, error) {
 		batch = 10
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, to_email, subject, body, attempts FROM email_outbox
+		`SELECT id, to_email, subject, body, COALESCE(html_body, ''), attempts FROM email_outbox
 		 WHERE status = 'PENDING' AND attempts < 10
 		 ORDER BY created_at ASC LIMIT $1
 		 FOR UPDATE SKIP LOCKED`,
@@ -221,12 +244,13 @@ func (s *Service) ProcessOutbox(ctx context.Context, batch int) (int, error) {
 	type job struct {
 		id             uuid.UUID
 		to, subj, body string
+		html           string
 		attempts       int
 	}
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if err := rows.Scan(&j.id, &j.to, &j.subj, &j.body, &j.attempts); err != nil {
+		if err := rows.Scan(&j.id, &j.to, &j.subj, &j.body, &j.html, &j.attempts); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -236,7 +260,7 @@ func (s *Service) ProcessOutbox(ctx context.Context, batch int) (int, error) {
 
 	sent := 0
 	for _, j := range jobs {
-		err := s.deliver(ctx, j.to, j.subj, j.body)
+		err := s.deliver(ctx, j.to, j.subj, j.body, j.html)
 		if err == nil {
 			_, _ = s.pool.Exec(ctx, `UPDATE email_outbox SET status = 'SENT', sent_at = NOW(), attempts = attempts + 1 WHERE id = $1`, j.id)
 			sent++
@@ -249,17 +273,22 @@ func (s *Service) ProcessOutbox(ctx context.Context, batch int) (int, error) {
 }
 
 // deliver sends a single email via the configured provider.
-func (s *Service) deliver(ctx context.Context, to, subject, body string) error {
+// htmlBody is optional; when set, the provider is given both forms
+// and Resend picks the html version. Empty htmlBody falls back to
+// plain text via the EmailMessage.Body field.
+func (s *Service) deliver(ctx context.Context, to, subject, body, htmlBody string) error {
 	msg := EmailMessage{
 		From:    s.fromAddr,
 		To:      to,
 		Subject: subject,
 		Body:    body,
+		HTML:    htmlBody,
 	}
 	s.log.Info("delivering email",
 		"provider", s.provider.Name(),
 		"to", to,
 		"subject", subject,
+		"has_html", htmlBody != "",
 	)
 	return s.provider.Send(ctx, msg)
 }

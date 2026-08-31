@@ -98,7 +98,8 @@ jobs:
                   -- ':!*.md' \
                   ':!tests/test_i18n.py' \
                   ':!tests/test_withdraw.py' \
-                  ':!tests/test_settings.py' || true)
+                  ':!tests/test_settings.py' \
+                  ':!internal/notifier/templates/locales/zh.json' || true)
           if [ -n "$HITS" ]; then
             echo "Found Chinese characters in non-i18n source:"
             echo "$HITS"
