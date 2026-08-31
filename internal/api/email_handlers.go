@@ -75,7 +75,7 @@ func sendVerifyEmail(d Deps, r *http.Request, uid uuid.UUID, email string) {
 		d.Log.Warn("create verify token failed", "user_id", uid, "error", err)
 		return
 	}
-	url := publicBaseURL() + "/auth/verify-email?token=" + plaintext
+	url := publicBaseURL() + "/verify-email?token=" + plaintext
 	subject, html, text, err := templates.Render(templates.KindVerifyEmail, templates.Params{
 		Lang:      shortLang(r.Header.Get("Accept-Language")),
 		Email:     email,
@@ -157,7 +157,7 @@ func forgotPasswordHandler(d Deps) http.HandlerFunc {
 			writeJSON(w, http.StatusOK, map[string]string{"message": "if the email exists, a reset link has been sent"})
 			return
 		}
-		url := publicBaseURL() + "/auth/reset-password?token=" + plaintext
+		url := publicBaseURL() + "/reset-password?token=" + plaintext
 		subject, html, text, err := templates.Render(templates.KindResetPwd, templates.Params{
 			Lang:      shortLang(r.Header.Get("Accept-Language")),
 			Email:     req.Email,
