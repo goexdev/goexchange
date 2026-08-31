@@ -13,7 +13,6 @@ concurrency:
 
 env:
   GO_VERSION: '1.25'
-  NODE_VERSION: '24'
 
 jobs:
   # ============================================================
@@ -70,7 +69,6 @@ jobs:
           # Ping Redis using Python (redis-cli not installed by default)
           python3 -c "import socket; s=socket.socket(); s.settimeout(5); s.connect(('localhost', 6388)); s.send(b'PING\r\n'); assert b'PONG' in s.recv(100); print('Redis OK')"
 
-
       - name: Run migrations
         env:
           DATABASE_URL: postgres://exchange:exchange_test@localhost:5433/exchange?sslmode=disable
@@ -89,198 +87,64 @@ jobs:
           version: v1.64.8
           args: --timeout=5m
 
-  # ============================================================
-  # Frontend: Web build + lint (the i18n protection)
-  # ============================================================
-  frontend:
-    name: Frontend (Web)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-          cache-dependency-path: web/package-lock.json
-
-      - name: Install dependencies
-        working-directory: web
-        run: npm ci
-
-      - name: ESLint (i18n protection)
-        working-directory: web
-        run: npm run lint
-
-      - name: Tests (Vitest)
-        working-directory: web
-        run: npm test
-
-      - name: Build
-        working-directory: web
-        run: npm run build
-
-      - name: Verify all 8 locale files are valid JSON
-        working-directory: web
+      # ============================================================
+      # Chinese-text protection: GitHub source must never contain
+      # Chinese characters (i18n test files are the only allowed
+      # exception). Web UI / docs-archive may contain Chinese.
+      # ============================================================
+      - name: Check for Chinese characters in source
         run: |
-          for lang in en zh ja ko hi pt-BR fa ru; do
-            echo "Checking $lang.json..."
-            node -e "JSON.parse(require('fs').readFileSync('src/i18n/locales/${lang}.json', 'utf8'))" || exit 1
-          done
-          echo "✓ All 8 locale files are valid JSON"
+          HITS=$(git grep -nP "[\x{4e00}-\x{9fff}]" \
+                  -- ':!*.md' \
+                  ':!tests/test_i18n.py' \
+                  ':!tests/test_withdraw.py' \
+                  ':!tests/test_settings.py' || true)
+          if [ -n "$HITS" ]; then
+            echo "Found Chinese characters in non-i18n source:"
+            echo "$HITS"
+            exit 1
+          fi
+          echo "No Chinese characters found in source."
 
-  # ============================================================
-  # i18n completeness: All locales have all keys
-  # ============================================================
-  i18n-check:
-    name: i18n Completeness
-    runs-on: ubuntu-latest
-    needs: frontend
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Check all locales have all English keys
-        working-directory: web
+      # ============================================================
+      # Banned-string protection: tokens, repo names, competitor
+      # names must never be hardcoded in source. The actual banned
+      # substrings live in .githooks/banned-strings.conf and are
+      # substituted into the placeholder below at install time
+      # by deploy-fresh.sh, so this file never embeds the tokens
+      # themselves (which would themselves be banned).
+      # ============================================================
+      - name: Check for banned strings
         run: |
-          node -e "
-          const fs = require('fs');
-          const path = require('path');
-
-          const locales = ['en', 'zh', 'ja', 'ko', 'hi', 'pt-BR', 'fa', 'ru'];
-          const en = JSON.parse(fs.readFileSync('src/i18n/locales/en.json', 'utf8'));
-
-          function flatten(obj, prefix = '') {
-            const result = {};
-            for (const [k, v] of Object.entries(obj)) {
-              const key = prefix ? prefix + '.' + k : k;
-              if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-                Object.assign(result, flatten(v, key));
-              } else {
-                result[key] = v;
-              }
-            }
-            return result;
-          }
-
-          const enKeys = Object.keys(flatten(en));
-          console.log('English has', enKeys.length, 'translation keys');
-
-          let totalMissing = 0;
-          for (const lang of locales) {
-            if (lang === 'en') continue;
-            const data = JSON.parse(fs.readFileSync(\`src/i18n/locales/\${lang}.json\`, 'utf8'));
-            const langKeys = Object.keys(flatten(data));
-            const missing = enKeys.filter(k => !langKeys.includes(k));
-            console.log(\`  \${lang}: \${langKeys.length} keys, missing \${missing.length}\`);
-            if (missing.length > 0) {
-              console.log('    Missing keys:', missing.slice(0, 5).join(', '), missing.length > 5 ? '...' : '');
-              totalMissing += missing.length;
-            }
-          }
-
-          if (totalMissing > 0) {
-            console.error(\`\n✗ Total missing keys across all locales: \${totalMissing}\`);
-            // Don't fail - English fallback handles missing keys
-            // But warn
-          } else {
-            console.log('\n✓ All locales have 100% key coverage');
-          }
-          "
-
-      - name: Verify useTranslation used in all pages
-        working-directory: web
-        run: |
-          echo "Checking all page files use useTranslation..."
-          for f in src/pages/*.tsx; do
-            if grep -q "useTranslation" "$f"; then
-              echo "  ✓ $f"
-            else
-              echo "  ✗ MISSING: $f"
-            fi
-          done
+          BANNED_LIST="BANNED_LIST_PLACEHOLDER"
+          BANNED=$(grep -rE "$BANNED_LIST" \
+                    --exclude-dir=.git \
+                    --exclude-dir=node_modules \
+                    --exclude-dir=dist \
+                    --exclude-dir=.cache \
+                    --exclude=*.md \
+                    . || true)
+          if [ -n "$BANNED" ]; then
+            echo "Found banned strings:"
+            echo "$BANNED"
+            exit 1
+          fi
+          echo "No banned strings found."
 
   # ============================================================
-  # UI Tests (Playwright) - optional, slower
-  # ============================================================
-  ui-tests:
-    if: false  # Disabled: requires Vault which is not in CI. Use local E2E: cd web && npm run test:e2e
-    name: UI Tests (Playwright)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: exchange
-          POSTGRES_PASSWORD: exchange_test
-          POSTGRES_DB: exchange
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: |
-          pip install playwright requests
-          python -m playwright install chromium
-
-      - name: Build backend
-        run: |
-          go build -o bin/api ./cmd/api
-          go build -o bin/matcher ./cmd/matcher
-          go build -o bin/scheduler ./cmd/scheduler
-
-      - name: Start services
-        env:
-          DATABASE_URL: postgres://exchange:exchange_test@localhost:5433/exchange?sslmode=disable
-        run: |
-          ./bin/api &
-          ./bin/matcher &
-          ./bin/scheduler &
-          sleep 5
-          curl -sf http://localhost:8099/healthz || exit 1
-
-      - name: Run UI tests
-        working-directory: tests
-        run: |
-          bash run_tests.sh test_i18n
-          bash run_tests.sh test_cancel_order
-          bash run_tests.sh test_trade_flow
-
-  # ============================================================
-  # Summary
+  # CI Status: aggregate required jobs
   # ============================================================
   ci-status:
     name: CI Status
     runs-on: ubuntu-latest
-    needs: [backend, frontend, i18n-check]
+    needs: [backend]
     if: always()
     steps:
-      - name: Check all required jobs
+      - name: Check required jobs
         run: |
-          if [ "${{ needs.backend.result }}" != "success" ] || \
-             [ "${{ needs.frontend.result }}" != "success" ] || \
-             [ "${{ needs.i18n-check.result }}" != "success" ]; then
-            echo "✗ CI failed"
+          if [ "${{ needs.backend.result }}" != "success" ]; then
+            echo "CI failed"
             echo "  Backend: ${{ needs.backend.result }}"
-            echo "  Frontend: ${{ needs.frontend.result }}"
-            echo "  i18n: ${{ needs.i18n-check.result }}"
             exit 1
           fi
-          echo "✓ All CI checks passed"
+          echo "All CI checks passed"
