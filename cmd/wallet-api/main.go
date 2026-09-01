@@ -106,25 +106,22 @@ func main() {
 
 	// Blockchain adapter registry. V1 only registers TRON; V2 will
 	// add BTC / ETH / EVM / SOL adapters alongside.
+	//
+	// Providers come from environment variables. Both
+	// TRON_PRIMARY_URL and TRON_BACKUP_URL are optional: with just
+	// one set we run with a single provider; with both set we get
+	// failover; with neither set we skip the real adapter so the
+	// wallet-api still boots (registry stubs handle the rest).
 	registry := blockchain.NewRegistry()
-	tronAd, err := tronadapter.NewAdapter(tronadapter.Config{
-		Primary: tronadapter.Provider{
-			Name:    "quicknode",
-			BaseURL: os.Getenv("TRON_PRIMARY_URL"),
-			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
-		},
-		Backup: tronadapter.Provider{
-			Name:    "chainstack",
-			BaseURL: os.Getenv("TRON_BACKUP_URL"),
-			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
-		},
-		Logger: log,
-	})
+	tronAd, err := buildTronAdapter(os.Getenv("TRON_PRIMARY_URL"), os.Getenv("TRON_PRIMARY_KEY"),
+		os.Getenv("TRON_BACKUP_URL"), os.Getenv("TRON_BACKUP_KEY"), log)
 	if err != nil {
 		log.Warn("tron adapter init failed (RPC URLs missing); wallet-api will use registry fallback", "error", err)
 	} else {
 		registry.Register(tronAd)
-		log.Info("tron adapter registered", "network", tronAd.Network())
+		log.Info("tron adapter registered",
+			"network", tronAd.Network(),
+			"providers", len(tronAd.Providers()))
 	}
 	// Stub the remaining chains so the registry has no surprises
 	// when the wallet service looks them up. The V1 TRON path is
@@ -492,3 +489,46 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 
 // Ensure unused imports do not trip build when the file grows.
 var _ = fmt.Sprintf
+
+// buildTronAdapter assembles a TRON adapter from the four
+// TRON_PRIMARY_URL/PRIMARY_KEY/BACKUP_URL/BACKUP_KEY env vars.
+// Either side of the primary/backup pair is optional; we omit the
+// empty one entirely so a single-provider deploy does not get
+// spurious "falling back" log noise.
+//
+// Names default to "primary" / "backup" so the admin /metrics
+// endpoints have something stable to label; production deployments
+// can override by exporting TRON_PRIMARY_NAME / TRON_BACKUP_NAME.
+func buildTronAdapter(primaryURL, primaryKey, backupURL, backupKey string, log *slog.Logger) (*tronadapter.Adapter, error) {
+	var providers []tronadapter.Provider
+	if primaryURL != "" {
+		providers = append(providers, tronadapter.Provider{
+			Name:    envOr("TRON_PRIMARY_NAME", "primary"),
+			BaseURL: primaryURL,
+			APIKey:  primaryKey,
+			Weight:  1,
+		})
+	}
+	if backupURL != "" {
+		providers = append(providers, tronadapter.Provider{
+			Name:    envOr("TRON_BACKUP_NAME", "backup"),
+			BaseURL: backupURL,
+			APIKey:  backupKey,
+			Weight:  1, // equal weight to primary; admins adjust via future config
+		})
+	}
+	if len(providers) == 0 {
+		return nil, errors.New("no TRON providers configured (set TRON_PRIMARY_URL or TRON_BACKUP_URL)")
+	}
+	return tronadapter.NewAdapter(tronadapter.Config{
+		Providers: providers,
+		Logger:    log,
+	})
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}

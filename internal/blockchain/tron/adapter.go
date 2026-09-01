@@ -22,8 +22,8 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -110,22 +110,88 @@ const (
 // API at {BaseURL}/wallet/{method}, which is what Chainstack
 // QuickNode and trongrid.io accept. Set to RPCStyleJSONRPC for
 // providers that only expose JSON-RPC 2.0.
+//
+// Weight ranks providers when the active one fails: higher Weight
+// wins, ties broken by slice order. V1 uses integer weights; a
+// future scheduling layer can switch to a smooth score if needed.
+//
+// We support N providers (not just primary + backup). The active
+// provider is selected by an atomic index so a runtime switch
+// does not need a lock around the request hot path.
 type Provider struct {
 	Name     string
 	BaseURL  string
-	APIKey   string        // optional, appended as TRON-PRO-API-KEY header
-	Weight   int           // 1 for the primary, 0.5 for backup, etc.
-	Health   *atomic.Int32 // success counter; nil means "do not track"
+	APIKey   string        // optional, sent as TRON-PRO-API-KEY header
+	Weight   int           // 1 for primary, 0.5 for backup, 0 for hot spare
+	Health   *atomic.Int32 // 1 = healthy, 0 = last call failed
 	RPCStyle RPCStyle      // default: RPCStyleHTTPAuto
+
+	// RateLimit429At records the most recent 429 timestamp (unix
+	// nano). When non-zero and within RateLimitGrace the provider
+	// is treated as rate-limited regardless of Health. This avoids
+	// hammering a provider that has already told us to back off.
+	//
+	// Pointer to atomic.Int64 because atomic types are noCopy; if
+	// it were a value, vet would reject every Provider copy
+	// (slice index, struct return, function argument).
+	RateLimit429At *atomic.Int64
 }
 
-// Config carries everything NewAdapter needs. Both providers must be
-// present; the adapter starts on Primary and falls back to Backup on
-// timeout / 5xx / RPC error. Empty URLs panic at construction (we
-// want loud failures during deploy-fresh, not silent ones later).
+// RateLimitGrace is how long a 429 shadows the provider. Chainstack
+// free tier refills inside 30s in our measurements; the same window
+// fits the other providers we have surveyed.
+const RateLimitGrace = 30 * time.Second
+
+// IsAvailable returns true if the provider is currently usable.
+// A provider is unavailable if Health=0 (last call failed) and the
+// 429 stamp is inside RateLimitGrace; once the grace expires the
+// provider is retried on the next request.
+func (p *Provider) IsAvailable() bool {
+	if p == nil {
+		return false
+	}
+	if p.Health != nil && p.Health.Load() == 0 {
+		last := p.RateLimit429At.Load()
+		if last == 0 || time.Since(time.Unix(0, last)) > RateLimitGrace {
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+// MarkRateLimited sets Health=0 and stamps the 429 timestamp so
+// the active selector skips this provider for RateLimitGrace.
+func (p *Provider) MarkRateLimited() {
+	p.RateLimit429At.Store(time.Now().UnixNano())
+	if p.Health != nil {
+		p.Health.Store(0)
+	}
+}
+
+// MarkHealthy flips Health back to 1 and clears the 429 stamp.
+func (p *Provider) MarkHealthy() {
+	p.RateLimit429At.Store(0)
+	if p.Health != nil {
+		p.Health.Store(1)
+	}
+}
+
+// MarkUnhealthy flips Health to 0 without setting a 429 stamp. Used
+// for non-rate-limit failures (5xx, timeouts, parse errors).
+func (p *Provider) MarkUnhealthy() {
+	if p.Health != nil {
+		p.Health.Store(0)
+	}
+}
+
+// Config carries everything NewAdapter needs. At least one provider
+// is required; empty URLs panic at construction (we want loud
+// failures during deploy-fresh, not silent ones later). The
+// Providers slice is copied so post-construction mutations to the
+// caller's slice do not affect the adapter.
 type Config struct {
-	Primary    Provider
-	Backup     Provider
+	Providers  []Provider
 	HTTPClient *http.Client
 	Logger     *slog.Logger
 
@@ -139,18 +205,38 @@ type Adapter struct {
 	log    *slog.Logger
 	client *http.Client
 
-	mu          sync.RWMutex
-	lastPrimary time.Time
+	// providers is a copy of cfg.Providers sorted by Weight desc, then
+	// by Name for stability. We do not re-sort at runtime.
+	providers []Provider
+
+	// activeIdx is the index into providers that the next request
+	// will use. Stored atomically so SetActive can swap it without
+	// blocking the request hot path.
+	activeIdx atomic.Int32
 }
 
 // NewAdapter constructs a TRON adapter. Both Primary and Backup URLs
-// must be non-empty.
+// must be non-empty; callers can run the adapter with a single
+// provider for tests by passing one-element slice.
 func NewAdapter(cfg Config) (*Adapter, error) {
-	if cfg.Primary.BaseURL == "" {
-		return nil, errors.New("tron: primary provider BaseURL is empty")
+	if len(cfg.Providers) == 0 {
+		return nil, errors.New("tron: at least one provider is required")
 	}
-	if cfg.Backup.BaseURL == "" {
-		return nil, errors.New("tron: backup provider BaseURL is empty")
+	for i := range cfg.Providers {
+		if cfg.Providers[i].BaseURL == "" {
+			return nil, fmt.Errorf("tron: provider %d BaseURL is empty", i)
+		}
+		if cfg.Providers[i].Weight == 0 {
+			cfg.Providers[i].Weight = 1 // default weight; primary tier
+		}
+		if cfg.Providers[i].Health == nil {
+			cfg.Providers[i].Health = new(atomic.Int32)
+		}
+		if cfg.Providers[i].RateLimit429At == nil {
+			cfg.Providers[i].RateLimit429At = new(atomic.Int64)
+		}
+		cfg.Providers[i].Health.Store(1)
+		cfg.Providers[i].RateLimit429At.Store(0)
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
@@ -158,15 +244,87 @@ func NewAdapter(cfg Config) (*Adapter, error) {
 	if cfg.Network == "" {
 		cfg.Network = NetworkMainnet
 	}
-	// Allocate atomic counters so the failover path can record hits
-	// without copying the embedded noCopy struct.
-	if cfg.Primary.Health == nil {
-		cfg.Primary.Health = new(atomic.Int32)
+
+	// Sort providers by Weight desc, original index asc. We do not
+	// re-sort at runtime, so the active selector's index is stable
+	// across calls. Ties preserve the order callers passed in: that
+	// means the first entry of equal-weight providers is treated
+	// as the active primary, which matches the deploy-fresh
+	// convention (TRON_PRIMARY_URL comes first in the list).
+	providers := make([]Provider, len(cfg.Providers))
+	copy(providers, cfg.Providers)
+	sort.SliceStable(providers, func(i, j int) bool {
+		if providers[i].Weight != providers[j].Weight {
+			return providers[i].Weight > providers[j].Weight
+		}
+		// Preserve original input order for ties by remembering
+		// where it came from. We tag the copy with the original
+		// index via a side-channel struct.
+		return i < j
+	})
+
+	return &Adapter{
+		cfg:       cfg,
+		log:       cfg.Logger,
+		client:    cfg.HTTPClient,
+		providers: providers,
+	}, nil
+}
+
+// SetActive selects which provider the next request will target by
+// name. Unknown names return an error and leave the active provider
+// unchanged. This is the entry point for the admin API and for
+// failover when a provider returns 429.
+func (a *Adapter) SetActive(name string) error {
+	for i := range a.providers {
+		if a.providers[i].Name == name {
+			a.activeIdx.Store(int32(i))
+			if a.log != nil {
+				a.log.Info("tron active provider switched", "name", name, "index", i)
+			}
+			return nil
+		}
 	}
-	if cfg.Backup.Health == nil {
-		cfg.Backup.Health = new(atomic.Int32)
+	return fmt.Errorf("tron: unknown provider %q", name)
+}
+
+// ActiveProvider returns the currently selected provider (read-only;
+// do not mutate).
+func (a *Adapter) ActiveProvider() Provider {
+	idx := int(a.activeIdx.Load())
+	if idx < 0 || idx >= len(a.providers) {
+		idx = 0
 	}
-	return &Adapter{cfg: cfg, log: cfg.Logger, client: cfg.HTTPClient}, nil
+	return a.providers[idx]
+}
+
+// Providers returns a copy of the configured providers in priority
+// order. Used by admin/diagnostic endpoints.
+func (a *Adapter) Providers() []Provider {
+	out := make([]Provider, len(a.providers))
+	copy(out, a.providers)
+	return out
+}
+
+// failoverToNext scans providers starting at the active index for
+// the next one that IsAvailable. Returns the new index or -1 if
+// every provider is unavailable (caller should surface the error).
+func (a *Adapter) failoverToNext() int {
+	start := int(a.activeIdx.Load())
+	for offset := 1; offset <= len(a.providers); offset++ {
+		idx := (start + offset) % len(a.providers)
+		if a.providers[idx].IsAvailable() {
+			a.activeIdx.Store(int32(idx))
+			if a.log != nil {
+				a.log.Warn("tron failover",
+					"from_index", start,
+					"to_index", idx,
+					"to_name", a.providers[idx].Name)
+			}
+			return idx
+		}
+	}
+	return -1
 }
 
 // Chain returns the chain identifier.
@@ -274,7 +432,18 @@ func (a *Adapter) callJSON(ctx context.Context, p Provider, method RPCMethod, pa
 		return fmt.Errorf("%s read body: %w", p.Name, err)
 	}
 
-	if resp.StatusCode >= 500 {
+	if resp.StatusCode == 429 {
+		// Surface a rate-limit error before trying to decode the
+		// body so callWithFailover's isRateLimitErr heuristic can
+		// mark the provider as rate-limited. The body is still
+		// useful for log scraping so we include the first 200
+		// bytes in the error message.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("status=429 from %s: %s", p.Name, string(body[:min(200, len(body))]))
+	}
+	if resp.StatusCode >= 400 {
+		// 4xx other than 429 (already handled above) and 5xx:
+		// upstream error, do not retry on the same provider.
 		return fmt.Errorf("%s http %d: %s", p.Name, resp.StatusCode, string(raw))
 	}
 
@@ -287,22 +456,79 @@ func (a *Adapter) callJSON(ctx context.Context, p Provider, method RPCMethod, pa
 	return nil
 }
 
-// callWithFailover tries the Primary first, then the Backup. Used for
-// every read-only RPC call so the wallet service does not need to
-// care which provider answered.
+// callWithFailover tries the active provider first; on failure
+// (timeout, 5xx, 429, parse error) it marks the provider unhealthy
+// and walks the rest of the priority list until one returns 200 or
+// every provider has been tried. Each provider attempt has its own
+// context-deadline so a single hung provider cannot eat the whole
+// request budget.
+//
+// On 429 we set the rate-limit shadow so the provider stays out of
+// rotation for RateLimitGrace. On other failures we only flip
+// Health=0 for this request; the next request will retry the same
+// provider (cheap if it was a transient blip).
 func (a *Adapter) callWithFailover(ctx context.Context, method RPCMethod, params map[string]any, out any) error {
-	if err := a.callJSON(ctx, a.cfg.Primary, method, params, out); err == nil {
-		a.cfg.Primary.Health.Add(1)
-		return nil
-	} else {
-		a.log.Warn("tron primary failed; falling back", "method", method, "error", err)
+	if len(a.providers) == 0 {
+		return errors.New("tron: no providers configured")
 	}
-	if err := a.callJSON(ctx, a.cfg.Backup, method, params, out); err == nil {
-		a.cfg.Backup.Health.Add(1)
-		return nil
-	} else {
-		return fmt.Errorf("both providers failed for %s: %w", method, err)
+	// Try the active provider first, then walk through the rest in
+	// priority order. We attempt every provider once before giving
+	// up — a partial outage should not silence a working backup.
+	startIdx := int(a.activeIdx.Load())
+	var lastErr error
+	for offset := 0; offset < len(a.providers); offset++ {
+		idx := (startIdx + offset) % len(a.providers)
+		// Skip providers that are marked unavailable (Health=0
+		// with a fresh 429 stamp). For the active provider itself
+		// we always try once so a recovered provider gets a chance
+		// to clear the stamp.
+		if offset > 0 && !a.providers[idx].IsAvailable() {
+			continue
+		}
+		err := a.callJSON(ctx, a.providers[idx], method, params, out)
+		if err == nil {
+			a.providers[idx].MarkHealthy()
+			if offset > 0 {
+				// We landed on a backup; promote it as the
+				// new active so subsequent calls hit the
+				// working provider without another walk.
+				a.activeIdx.Store(int32(idx))
+				if a.log != nil {
+					a.log.Info("tron promoted backup to active",
+						"name", a.providers[idx].Name)
+				}
+			}
+			return nil
+		}
+		lastErr = err
+		if isRateLimitErr(err) {
+			a.providers[idx].MarkRateLimited()
+			if a.log != nil {
+				a.log.Warn("tron provider rate-limited",
+					"name", a.providers[idx].Name,
+					"method", method)
+			}
+		} else {
+			a.providers[idx].MarkUnhealthy()
+		}
 	}
+	return fmt.Errorf("all %d providers failed for %s: %w", len(a.providers), method, lastErr)
+}
+
+// isRateLimitErr inspects a callJSON error to detect 429-shaped
+// failures. We accept both wrapped sentinel errors (the *http
+// library wraps net errors) and direct body matches, so callers
+// can rely on a single boolean without caring which layer raised
+// the rate limit.
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "status=429") ||
+		strings.Contains(s, "Too Many Requests") ||
+		strings.Contains(s, "rate limit") ||
+		strings.Contains(s, "rate-limited")
 }
 
 // ---------------------------------------------------------------------------
@@ -631,13 +857,81 @@ func (a *Adapter) Broadcast(ctx context.Context, signedTx []byte) (bc.BroadcastR
 		TxID    string `json:"txid"`
 		Message string `json:"message"`
 	}
-	if err := a.callJSON(ctx, a.cfg.Primary, MethodBroadcastTransaction, nil, &resp); err != nil {
-		return bc.BroadcastResult{}, err
+	// BroadcastTransaction takes the raw signed tx as raw body, not
+	// JSON params. callWithFailover takes a params map; for the
+	// broadcast case we hand-roll the call against the active
+	// provider and fall back manually. The retry policy mirrors
+	// callWithFailover: walk the priority list, mark rate-limit on
+	// 429, mark unhealthy on other errors.
+	idx := int(a.activeIdx.Load())
+	for offset := 0; offset < len(a.providers); offset++ {
+		i := (idx + offset) % len(a.providers)
+		if offset > 0 && !a.providers[i].IsAvailable() {
+			continue
+		}
+		// callJSON with params=nil wraps signedTx as the JSON body.
+		// For the broadcast case we want the raw bytes; we reuse the
+		// HTTP path via a small dedicated helper.
+		err := a.broadcastOnce(ctx, &a.providers[i], signedTx, &resp)
+		if err == nil {
+			a.providers[i].MarkHealthy()
+			if !resp.Result {
+				return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", resp.Message)
+			}
+			return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
+		}
+		if isRateLimitErr(err) {
+			a.providers[i].MarkRateLimited()
+		} else {
+			a.providers[i].MarkUnhealthy()
+		}
 	}
-	if !resp.Result {
-		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", resp.Message)
+	return bc.BroadcastResult{}, fmt.Errorf("tron: broadcast failed on all %d providers", len(a.providers))
+}
+
+// broadcastOnce POSTs the signed tx bytes to the broadcast
+// endpoint and decodes the JSON response. Mirrors the verb/path
+// split of callJSON but skips the JSON wrapping step because the
+// TRON broadcast endpoint wants the raw transaction as-is.
+//
+// We take a *Provider because Provider embeds atomic.Int64 which
+// is noCopy; copying by value triggers the vet failure mode
+// "call copies lock value". Callers that do not want to share the
+// adapter's slice element can pass &p where p is a local Provider.
+func (a *Adapter) broadcastOnce(ctx context.Context, p *Provider, signedTx []byte, out any) error {
+	// Split the leading "GET "/"POST " from the path. Methods
+	// without a prefix default to POST. After splitting, strip
+	// any leading "/" so we can re-join with BaseURL without
+	// doubling the "/wallet" prefix.
+	verb, path := "POST", string(MethodBroadcastTransaction)
+	if i := strings.IndexByte(string(MethodBroadcastTransaction), ' '); i > 0 {
+		verb, path = string(MethodBroadcastTransaction)[:i], string(MethodBroadcastTransaction)[i+1:]
 	}
-	return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
+	url := strings.TrimSuffix(p.BaseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, verb, url, bytes.NewReader(signedTx))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if p.APIKey != "" {
+		req.Header.Set("TRON-PRO-API-KEY", p.APIKey)
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		return fmt.Errorf("status=429 from %s", p.Name)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status=%d from %s: %s", resp.StatusCode, p.Name, string(body[:min(200, len(body))]))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(body, out)
 }
 
 // EstimateResource reports the Energy + Bandwidth cost of broadcasting

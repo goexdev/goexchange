@@ -29,10 +29,16 @@ func TestChainstackIntegration(t *testing.T) {
 	// BaseURL is the host + token path; per-method paths add the
 	// "/wallet/{method}" suffix. This avoids the double-prefix bug
 	// we hit when the base already included "/wallet".
+	//
+	// V1.1: pass two distinct entries (primary + backup both
+	// pointing at the same URL) so the failover loop exercises the
+	// multi-provider code path even in single-provider deploys.
 	base := "https://tron-mainnet.core.chainstack.com/" + token
 	a, err := NewAdapter(Config{
-		Primary: Provider{Name: "chainstack-test", BaseURL: base},
-		Backup:  Provider{Name: "chainstack-test", BaseURL: base},
+		Providers: []Provider{
+			{Name: "chainstack-test-primary", BaseURL: base, Weight: 1},
+			{Name: "chainstack-test-backup", BaseURL: base, Weight: 1},
+		},
 		Logger:  slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		Network: NetworkMainnet,
 	})

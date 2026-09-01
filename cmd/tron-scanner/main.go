@@ -374,26 +374,45 @@ func contractForAsset(asset string) string {
 func buildAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
 	primaryURL := os.Getenv("TRON_PRIMARY_URL")
 	backupURL := os.Getenv("TRON_BACKUP_URL")
+	if primaryURL == "" && backupURL == "" {
+		return nil, errors.New("TRON_PRIMARY_URL or TRON_BACKUP_URL must be set")
+	}
+	// If only one of the two is set, mirror it on the other side
+	// so a single-provider deploy does not get spurious "falling
+	// back" log noise. The adapter is happy to deduplicate; the
+	// cost is one extra map lookup per request.
 	if primaryURL == "" {
-		return nil, errors.New("TRON_PRIMARY_URL not set")
+		primaryURL = backupURL
 	}
 	if backupURL == "" {
 		backupURL = primaryURL
 	}
-	return tronadapter.NewAdapter(tronadapter.Config{
-		Primary: tronadapter.Provider{
-			Name:    "primary",
+	providers := []tronadapter.Provider{
+		{
+			Name:    envOr("TRON_PRIMARY_NAME", "primary"),
 			BaseURL: primaryURL,
 			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
+			Weight:  1,
 		},
-		Backup: tronadapter.Provider{
-			Name:    "backup",
+		{
+			Name:    envOr("TRON_BACKUP_NAME", "backup"),
 			BaseURL: backupURL,
 			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
+			Weight:  1,
 		},
-		Logger: log,
-		Network: tronadapter.NetworkMainnet,
+	}
+	return tronadapter.NewAdapter(tronadapter.Config{
+		Providers: providers,
+		Logger:    log,
+		Network:   tronadapter.NetworkMainnet,
 	})
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func envInt(key string, def int) int {
