@@ -435,6 +435,22 @@ else
 fi
 
 # ============================================================================
+# Step 6.5: seed email templates (config/email/)
+#
+# Email templates now live outside the binary so a copy fix does not
+# require a rebuild. On first boot the API falls back to embedded
+# defaults and writes them into config/email/; we pre-seed here so
+# `git diff config/email/` shows what the running stack is using,
+# and so a fresh clone looks the same as a long-running deploy.
+# ============================================================================
+log "=== Step 6.5: seed email templates ==="
+if [ -d "$PUBLIC_DIR/config/email" ]; then
+    ok "config/email already present ($(ls "$PUBLIC_DIR/config/email" | wc -l) files; templates package will hot-reload on SIGHUP)"
+else
+    warn "config/email missing; API will fall back to embedded defaults and write them on first boot"
+fi
+
+# ============================================================================
 # Step 7: smoke test
 # ============================================================================
 log "=== Step 7: smoke test ==="

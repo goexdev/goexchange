@@ -1,6 +1,6 @@
 {
   "verify_email": {
-    "subject": "Verify your goexchange email",
+    "subject": "Verify your goexchange account NOW",
     "title": "Welcome to goexchange",
     "greeting": "Hi {{Email}}",
     "intro": "Thanks for signing up. To finish creating your account and start trading, please confirm this email address.",

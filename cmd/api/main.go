@@ -31,6 +31,7 @@ import (
 	"github.com/goexdev/goexchange/internal/audit"
 	"github.com/goexdev/goexchange/internal/signing"
 	"github.com/goexdev/goexchange/internal/notifier"
+	"github.com/goexdev/goexchange/internal/notifier/templates"
 	"github.com/goexdev/goexchange/internal/risk"
 	"github.com/goexdev/goexchange/internal/matching"
 	"github.com/goexdev/goexchange/internal/trading"
@@ -369,6 +370,18 @@ func run() error {
 
 	// Notifier setup (must be before chainwatcher.New which uses it)
 	nlog := log.With("component", "notifier")
+
+	// Externalise email templates to config/email/ so a copy fix
+	// at 3am does not require a rebuild. The package writes a copy
+	// of the embedded defaults on first boot so a fresh deploy still
+	// sends mail; operators edit the on-disk files and reload via
+	// kill -HUP or by waiting for the file watcher.
+	if err := templates.Init(); err != nil {
+		return fmt.Errorf("init email templates: %w", err)
+	}
+	ok, fail := templates.Stats()
+	log.Info("email templates initialised", "dir", templates.LocaleFileDir, "ok_reloads", ok, "failed_reloads", fail)
+
 	nprovider, err := notifier.NewProvider(
 
 		notifier.ProviderType(cfg.Notifier.Provider),
