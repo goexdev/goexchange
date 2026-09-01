@@ -1,28 +1,72 @@
-# Prometheus configuration for scraping goexchange API metrics.
+# Prometheus configuration for scraping goexchange services.
 #
-# Add this job to your existing prometheus.yml:
-#   scrape_configs:
-#     - job_name: goexchange-api
-#       scrape_interval: 15s
-#       static_configs:
-#         - targets: [goexchange.top:8099]  # Or internal hostname
+# Add this file to your existing prometheus.yml as a scrape_config
+# target. The compose stack (see compose.yml) includes Prometheus
+# on port 9090 with its own config; this file is the public-repo
+# source of truth that the compose stack mirrors.
+#
+# Each daemon exposes /metrics on its own port:
+#   - goexchange-api          :8099  (trading + user endpoints)
+#   - goexchange-wallet-api   :8098  (wallet-only endpoints, B4)
+#   - goexchange-signer       :50061  (gRPC health, no /metrics yet)
+#   - goexchange-tron-scanner :?     (block scan metrics, B5)
 
 scrape_configs:
-  # goexchange API (port 8099)
+  # Public trading API (port 8099)
   - job_name: goexchange-api
     scrape_interval: 15s
     scrape_timeout: 10s
     metrics_path: /metrics
     static_configs:
-      - targets:
-          - goexchange.top:8099   # Production
-          # - localhost:8099   # Dev
+      - targets: ["goexchange.top:8099"]   # Production
         labels:
           service: goexchange-api
           env: prod
 
-  # Optional: Matcher (port 8098)
-  # Matcher doesn't expose /metrics yet, but can be added
-  # - job_name: goexchange-matcher
+  # Public wallet API (port 8098, added B4). Same labels as the
+  # trading API because the two share the metrics package; we tag
+  # by service_name so dashboards can split them apart.
+  - job_name: goexchange-wallet-api
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["goexchange.top:8098"]
+        labels:
+          service: goexchange-wallet-api
+          env: prod
+
+  # TRON block scanner daemon (port 8098 + 1, see cmd/tron-scanner
+  # for the listen address). V1 does not yet expose /metrics on the
+  # scanner; the scrape config below is wired so adding the
+  # endpoint in B5.1b is a one-line change in cmd/tron-scanner.
+  - job_name: goexchange-tron-scanner
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["goexchange.top:8099"]   # same host as the API in V1
+        labels:
+          service: goexchange-tron-scanner
+          env: prod
+
+  # Optional: goexchange-matching (port 8098 + 2, core image).
+  # The matching image does not currently expose /metrics; this
+  # target is commented out so a missing scrape does not silently
+  # fail the whole scrape_configs block.
+  # - job_name: goexchange-matching
   #   static_configs:
-  #     - targets: [goexchange.top:8098]
+  #     - targets: ["goexchange.top:8098"]
+
+# Recording rules for alerts. Add to alerts.rules.yml in the
+# compose stack and wire them via Alertmanager.
+# Sample alerts (not yet implemented in B7):
+#   - alert: TronRPCAllDown
+#     expr: up{job="goexchange-api"} == 0
+#     for: 1m
+#   - alert: TronScannerLag
+#     expr: time() - goexchange_tron_scanner_last_block_timestamp > 120
+#     for: 2m
+#   - alert: WalletSignerDown
+#     expr: goexchange_signer_connected == 0
+#     for: 2m

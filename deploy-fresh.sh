@@ -70,9 +70,10 @@ MATCHING_CONTAINER="goexchange-matching"
 MATCHING_HOST_PORT="50051"
 MATCHING_IMAGE="ghcr.io/goexdev/goexchange-core:latest"
 
-# API / scheduler (run on host)
+# API / scheduler / wallet-api / tron-scanner (run on host)
 API_PORT="8099"
 SCHEDULER_PORT="8097"
+WALLET_API_PORT="8098"
 
 # Colors
 RED='\033[0;31m'
@@ -415,6 +416,30 @@ nohup ./bin/api      > /tmp/goexchange-api.log      2>&1 &
 echo $! > /tmp/goexchange-api.pid
 nohup ./bin/scheduler > /tmp/goexchange-scheduler.log 2>&1 &
 echo $! > /tmp/goexchange-scheduler.pid
+
+# Wallet API (B4) and tron-scanner (B5) are optional: they need
+# TRON RPC URLs and (for the wallet-api) the signer daemon. When
+# the URLs are missing we skip so a fresh deploy without RPC keys
+# still boots a working trading stack. The compose stack in V2
+# will gate this on a deployment-mode env var instead.
+if [ -n "${TRON_PRIMARY_URL:-}" ]; then
+    if [ -x ./bin/wallet-api ]; then
+        nohup ./bin/wallet-api > /tmp/goexchange-wallet-api.log 2>&1 &
+        echo $! > /tmp/goexchange-wallet-api.pid
+        ok "wallet-api launched (pid $(cat /tmp/goexchange-wallet-api.pid))"
+    else
+        warn "bin/wallet-api missing — run 'go build -o bin/wallet-api ./cmd/wallet-api'"
+    fi
+    if [ -x ./bin/tron-scanner ]; then
+        nohup ./bin/tron-scanner > /tmp/goexchange-tron-scanner.log 2>&1 &
+        echo $! > /tmp/goexchange-tron-scanner.pid
+        ok "tron-scanner launched (pid $(cat /tmp/goexchange-tron-scanner.pid))"
+    else
+        warn "bin/tron-scanner missing — run 'go build -o bin/tron-scanner ./cmd/tron-scanner'"
+    fi
+else
+    warn "TRON_PRIMARY_URL not set; skipping wallet-api and tron-scanner (B4/B5)"
+fi
 
 # Wait for API port
 for i in $(seq 1 20); do

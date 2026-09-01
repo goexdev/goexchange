@@ -169,6 +169,58 @@ services:
       start_period: 10s
       retries: 3
 
+  # Wallet API daemon (public). Exposes wallet-only REST endpoints
+  # (/wallet/v1/...) on :8098. The signer daemon dials the signer
+  # over the private docker network; the API does not. We host this
+  # as a service so it can scale independently of the public trading
+  # API and so a wallet crash does not take user-facing endpoints
+  # down. V1 runs on the host for ease of iteration; V2 will move
+  # the binary into a slim alpine image.
+  # wallet-api:
+  #   image: ghcr.io/goexdev/goexchange-wallet-api:latest
+  #   container_name: goexchange-wallet-api
+  #   build:
+  #     context: .
+  #     dockerfile: cmd/wallet-api/Dockerfile
+  #   environment:
+  #     SIGNER_ADDR: "signer:50061"
+  #     TRON_PRIMARY_URL: "${TRON_PRIMARY_URL}"
+  #     TRON_BACKUP_URL: "${TRON_BACKUP_URL}"
+  #     TRON_PRIMARY_KEY: "${TRON_PRIMARY_KEY}"
+  #     TRON_BACKUP_KEY: "${TRON_BACKUP_KEY}"
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #     signer: { condition: service_healthy }
+  #   ports: ["8098:8098"]
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8098 && exec 3<&-"]
+  #     interval: 30s
+  #     timeout: 5s
+  #     start_period: 10s
+  #
+  # TRON block scanner daemon (public). Polls the chain RPC for new
+  # USDT-TRC20 transfers, persists credits to the deposits table.
+  # Reads from the same vault secrets as the API; no outbound auth.
+  # tron-scanner:
+  #   image: ghcr.io/goexdev/goexchange-tron-scanner:latest
+  #   container_name: goexchange-tron-scanner
+  #   build:
+  #     context: .
+  #     dockerfile: cmd/tron-scanner/Dockerfile
+  #   environment:
+  #     TRON_PRIMARY_URL: "${TRON_PRIMARY_URL}"
+  #     TRON_BACKUP_URL: "${TRON_BACKUP_URL}"
+  #     TRON_PRIMARY_KEY: "${TRON_PRIMARY_KEY}"
+  #     TRON_BACKUP_KEY: "${TRON_BACKUP_KEY}"
+  #     TRON_POLL_SEC: "10"
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/health || exit 1"]
+  #     interval: 30s
+
 volumes:
   goexchange_pgdata:
   goexchange_redisdata:
