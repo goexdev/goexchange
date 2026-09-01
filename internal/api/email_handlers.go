@@ -117,7 +117,9 @@ func verifyEmailHandler(d Deps) http.HandlerFunc {
 			return
 		}
 		// Issue the JWT now that the user is verified.
-		token, err := d.AuthSvc.IssueToken(uid.String())
+		// Email-verified tokens are user-role; admin tokens are
+		// minted through /admin/login, not via email verification.
+		token, err := d.AuthSvc.IssueToken(uid.String(), "")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

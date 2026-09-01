@@ -391,7 +391,7 @@ func totpLoginCompleteHandler(d Deps) http.HandlerFunc {
 		}
 
 		// Issue full token
-		token, err := d.AuthSvc.IssueToken(u.ID.String())
+		token, err := d.AuthSvc.IssueToken(u.ID.String(), u.Role)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

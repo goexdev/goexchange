@@ -21,14 +21,19 @@ func NewService(secret string, ttl time.Duration) *Service {
 // Claims is a JWT claims struct.
 type Claims struct {
 	UserID string `json:"uid"`
+	Role   string `json:"role,omitempty"` // optional: "user" (default) | "admin"
 	Scope  string `json:"scope,omitempty"` // optional: "2fa_login" for temp tokens
 	jwt.RegisteredClaims
 }
 
-// IssueToken issues a JWT for a user.
-func (s *Service) IssueToken(userID string) (string, error) {
+// IssueToken issues a JWT for a user. Role is optional; when
+// empty the claim is omitted and downstream authorization
+// treats the token as a regular user token. Callers that issue
+// admin tokens should pass role="admin".
+func (s *Service) IssueToken(userID, role string) (string, error) {
 	claims := &Claims{
 		UserID: userID,
+		Role:   role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

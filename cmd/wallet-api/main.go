@@ -167,6 +167,7 @@ func main() {
 		jwtSecret: []byte(cfg.JWT.Secret),
 		wallet:    walletSvc,
 		signer:    signerC,
+		tronAd:    tronAd,
 	}
 
 	httpSrv := &http.Server{
@@ -194,11 +195,12 @@ func main() {
 
 // server holds the dependencies the wallet-api routes need.
 type server struct {
-	log       *slog.Logger
-	pool      *pgxpool.Pool
-	jwtSecret []byte
-	wallet    *wallet.ServiceV1
-	signer    *signerclient.Client
+	log        *slog.Logger
+	pool       *pgxpool.Pool
+	jwtSecret  []byte
+	wallet     *wallet.ServiceV1
+	signer     *signerclient.Client
+	tronAd     *tronadapter.Adapter
 }
 
 // routes returns the chi-equivalent http.Handler with the wallet
@@ -213,6 +215,16 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/wallet/v1/balance", s.auth(s.getBalance))
 	mux.HandleFunc("/wallet/v1/deposits", s.auth(s.listDeposits))
 	mux.HandleFunc("/wallet/v1/withdrawals", s.auth(s.listWithdrawals))
+	// Admin RPC control. Mounted under /admin/wallet/v1/rpc/* so
+	// the admin namespace stays separate from the user endpoints.
+	// Auth: same Bearer JWT as the rest of the API, plus a
+	// role=admin check (the JWT service emits role on the
+	// context). We do not gate these endpoints by IP allow-list
+	// because the admin user is provisioned manually.
+	mux.HandleFunc("/admin/wallet/v1/rpc/providers", s.adminAuth(s.listRpcProviders))
+	mux.HandleFunc("/admin/wallet/v1/rpc/switch", s.adminAuth(s.switchRpcProvider))
+	mux.HandleFunc("/admin/wallet/v1/rpc/failover", s.adminAuth(s.failoverRpcProvider))
+	mux.HandleFunc("/admin/wallet/v1/rpc/health", s.adminAuth(s.rpcHealth))
 	return logRequest(s.log, mux)
 }
 
@@ -245,6 +257,35 @@ func (s *server) auth(next func(http.ResponseWriter, *http.Request, uuid.UUID)) 
 	}
 }
 
+// adminAuth is auth with role=admin gating. The JWT must have
+// role="admin" in its claims; user-role tokens get 403.
+//
+// We re-verify per request instead of caching the verification
+// result because the JWT secret can be rotated via Vault and a
+// cached token from the old secret would silently keep passing.
+// The auth path is in-process so the per-request cost is a single
+// HMAC verify.
+func (s *server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
+	authSvc := auth.NewService(string(s.jwtSecret), 24*time.Hour)
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw := bearerToken(r)
+		if raw == "" {
+			writeJSONError(w, http.StatusUnauthorized, "missing bearer token")
+			return
+		}
+		claims, err := authSvc.VerifyToken(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusUnauthorized, "invalid token")
+			return
+		}
+		if claims.Role != "admin" {
+			writeJSONError(w, http.StatusForbidden, "admin role required")
+			return
+		}
+		next(w, r)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -257,6 +298,120 @@ func (s *server) health(w http.ResponseWriter, _ *http.Request) {
 		"ok":            true,
 		"template_reloads_ok":    ok,
 		"template_reloads_fail":  fail,
+	})
+}
+
+// listRpcProviders returns the configured TRON RPC providers and
+// marks the active one. Admin-only.
+func (s *server) listRpcProviders(w http.ResponseWriter, _ *http.Request) {
+	if s.tronAd == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "tron adapter not configured")
+		return
+	}
+	active := s.tronAd.ActiveProvider()
+	out := make([]map[string]any, 0, len(s.tronAd.Providers()))
+	for _, p := range s.tronAd.Providers() {
+		out = append(out, map[string]any{
+			"name":         p.Name,
+			"weight":       p.Weight,
+			"healthy":      p.Health == nil || p.Health.Load() == 1,
+			"available":    p.IsAvailable(),
+			"active":       p.Name == active.Name,
+			"rate_limited": p.RateLimit429At != nil && p.RateLimit429At.Load() > 0,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"providers": out,
+		"active":    active.Name,
+	})
+}
+
+// switchRpcProvider selects which TRON provider the next request
+// will target. Body: {"provider": "<name>"}. Returns 400 if the
+// name is not in the configured set.
+//
+// This endpoint is for ops use; it does not have rate limiting
+// or audit logging yet (V2 will add the latter by writing to the
+// admin_audit_log table).
+func (s *server) switchRpcProvider(w http.ResponseWriter, r *http.Request) {
+	if s.tronAd == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "tron adapter not configured")
+		return
+	}
+	var body struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Provider == "" {
+		writeJSONError(w, http.StatusBadRequest, "provider field required")
+		return
+	}
+	if err := s.tronAd.SetActive(body.Provider); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.log.Info("rpc provider switched via admin", "provider", body.Provider)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active": s.tronAd.ActiveProvider().Name,
+	})
+}
+
+// failoverRpcProvider forces the adapter to pick the next
+// available provider in priority order. Useful when a provider
+// is intermittently failing but has not yet been 429-marked.
+//
+// The endpoint returns the name of the new active provider and
+// the index it landed on, so the operator can confirm the
+// failover worked.
+func (s *server) failoverRpcProvider(w http.ResponseWriter, _ *http.Request) {
+	if s.tronAd == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "tron adapter not configured")
+		return
+	}
+	prev := s.tronAd.ActiveProvider().Name
+	idx := s.tronAd.FailoverToNext()
+	if idx < 0 {
+		writeJSONError(w, http.StatusServiceUnavailable, "no available providers")
+		return
+	}
+	newActive := s.tronAd.ActiveProvider().Name
+	s.log.Warn("rpc provider failed over via admin",
+		"from", prev, "to", newActive)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"previous": prev,
+		"active":   newActive,
+		"reason":   "manual",
+	})
+}
+
+// rpcHealth is a quick summary endpoint for ops dashboards.
+// Distinct from /wallet/v1/health because it talks about the
+// upstream chain, not the wallet-api binary itself.
+func (s *server) rpcHealth(w http.ResponseWriter, _ *http.Request) {
+	if s.tronAd == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"adapter": "not_configured",
+		})
+		return
+	}
+	active := s.tronAd.ActiveProvider()
+	healthyCount := 0
+	total := len(s.tronAd.Providers())
+	for _, p := range s.tronAd.Providers() {
+		if p.IsAvailable() {
+			healthyCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"adapter":          "tron",
+		"network":          s.tronAd.Network(),
+		"active":           active.Name,
+		"providers_total":  total,
+		"providers_ready":  healthyCount,
+		"active_healthy":   active.Health == nil || active.Health.Load() == 1,
 	})
 }
 

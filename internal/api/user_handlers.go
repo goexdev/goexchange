@@ -245,7 +245,7 @@ func loginHandler(d Deps) http.HandlerFunc {
 		}
 
 		// No 2FA - issue full token
-		token, err := d.AuthSvc.IssueToken(u.ID.String())
+		token, err := d.AuthSvc.IssueToken(u.ID.String(), u.Role)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

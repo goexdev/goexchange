@@ -306,6 +306,15 @@ func (a *Adapter) Providers() []Provider {
 	return out
 }
 
+// FailoverToNext is the exported form of failoverToNext. Admin
+// RPC endpoints call this when an operator wants to manually
+// promote the next provider without waiting for the next
+// request to fail. Returns the new active index, or -1 if every
+// provider is unavailable.
+func (a *Adapter) FailoverToNext() int {
+	return a.failoverToNext()
+}
+
 // failoverToNext scans providers starting at the active index for
 // the next one that IsAvailable. Returns the new index or -1 if
 // every provider is unavailable (caller should surface the error).
