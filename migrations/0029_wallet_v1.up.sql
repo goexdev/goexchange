@@ -59,7 +59,8 @@ ALTER TABLE wallet_addresses
     ADD COLUMN IF NOT EXISTS address_hex  VARCHAR(128),
     ADD COLUMN IF NOT EXISTS asset        VARCHAR(32)  NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS memo         TEXT,
-    ADD COLUMN IF NOT EXISTS exp_time     TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS exp_time     TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS status       VARCHAR(32)  NOT NULL DEFAULT 'ACTIVE';
 
 -- The old unique (user_id, chain, asset) is no longer the right
 -- invariant: a single user may have a DEPOSIT and a separate HOT

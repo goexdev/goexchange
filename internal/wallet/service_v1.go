@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	bc "github.com/goexdev/goexchange/internal/blockchain"
@@ -120,7 +121,7 @@ func (s *ServiceV1) AllocateDepositAddress(ctx context.Context, req AllocateAddr
 	if err == nil {
 		return &AllocateAddressResponse{Address: existing, Reused: true}, nil
 	}
-	if !errors.Is(err, errNoRow) {
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("lookup existing address: %w", err)
 	}
 
@@ -150,12 +151,28 @@ func (s *ServiceV1) AllocateDepositAddress(ctx context.Context, req AllocateAddr
 	// happen to share a hot wallet never collide on a derived
 	// address. (V1 returns index=0 to keep behaviour predictable
 	// while B6 wires the real index counter.)
-	index := uint32(0)
-	encoded, hexAddr, _, err := s.signer.Derive(ctx, req.Chain, index)
+	encoded, hexAddr, _, err := s.signer.Derive(ctx, req.Chain, 0)
 	if err != nil {
-		return nil, fmt.Errorf("signer.Derive: %w", err)
+		// Signer daemon failed (typically because V1 is still a
+		// stub that returns "TODO(B3)"). Fall back to the
+		// registry adapter so the rest of the system keeps
+		// working during the wiring phase.
+		s.log.Warn("signer.Derive failed; falling back to registry adapter",
+			"chain", req.Chain, "error", err)
+		if s.registry == nil {
+			return nil, fmt.Errorf("signer.Derive failed and no registry fallback: %w", err)
+		}
+		adapter, regErr := s.registry.For(bc.Chain(req.Chain))
+		if regErr != nil {
+			return nil, fmt.Errorf("signer %v + registry %v", err, regErr)
+		}
+		addr, genErr := adapter.GenerateAddress(ctx, 0)
+		if genErr != nil {
+			return nil, fmt.Errorf("signer %v + generate %v", err, genErr)
+		}
+		encoded, hexAddr = addr.Encoded, addr.Hex
 	}
-	return s.persistAllocatedAddress(ctx, req, encoded, hexAddr, index)
+	return s.persistAllocatedAddress(ctx, req, encoded, hexAddr, 0)
 }
 
 // persistAllocatedAddress writes one row to wallet_addresses inside a
