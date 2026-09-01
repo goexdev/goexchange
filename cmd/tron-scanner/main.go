@@ -28,6 +28,15 @@
 // user deposit address (looked up from `wallet_addresses`) are
 // persisted as deposit rows. Events that hit an address not in
 // our table are silently dropped — we are not a free indexer.
+//
+// Rate-limit handling (V1): Chainstack free tier is ~5 sustained
+// RPS with ~25 burst (sliding-window token bucket). The scanner
+// defaults to one poll every 10 seconds, which translates to ~5
+// RPS including getnowblock + getblockbynum + one
+// gettransactioninfobyid per tx. That is right at the free-tier
+// ceiling; a paid plan can crank TRON_POLL_SEC down to 2 without
+// hitting limits. On adapter errors we double the next interval up
+// to a 5-minute cap so a provider outage does not hammer the API.
 
 package main
 
@@ -127,8 +136,19 @@ func main() {
 		cancel()
 	}()
 
-	tick := time.NewTicker(time.Duration(pollSec) * time.Second)
-	defer tick.Stop()
+	// V1 uses a fixed-interval ticker plus exponential backoff on
+	// adapter errors. After every failure we double the next
+	// interval up to a 5-minute cap so a brief chain RPC outage
+	// does not hammer the provider; on the next success we reset
+	// back to the configured baseline. Chainstack free tier is
+	// ~5 sustained RPS with ~25 burst; one tick at the default
+	// 10s interval is well under the limit.
+	baseInterval := time.Duration(pollSec) * time.Second
+	currentInterval := baseInterval
+	const maxInterval = 5 * time.Minute
+	consecutiveFails := 0
+	timer := time.NewTimer(currentInterval)
+	defer timer.Stop()
 
 	log.Info("tron-scanner running",
 		"poll_sec", pollSec,
@@ -139,17 +159,48 @@ func main() {
 	// by the first tick.
 	if err := runOnce(ctx, scanner, pool, registry, adapter, contract, log); err != nil {
 		log.Warn("initial scan", "error", err)
+		consecutiveFails++
+		currentInterval = bumpInterval(baseInterval, currentInterval, maxInterval)
+	} else {
+		consecutiveFails = 0
 	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
+		case <-timer.C:
 			if err := runOnce(ctx, scanner, pool, registry, adapter, contract, log); err != nil {
 				log.Warn("scan tick", "error", err)
+				consecutiveFails++
+				currentInterval = bumpInterval(baseInterval, currentInterval, maxInterval)
+				log.Info("backing off",
+					"next_interval_sec", int(currentInterval.Seconds()),
+					"consecutive_fails", consecutiveFails)
+			} else {
+				if consecutiveFails > 0 {
+					log.Info("recovered from failures", "consecutive_fails", consecutiveFails)
+				}
+				consecutiveFails = 0
+				currentInterval = baseInterval
 			}
+			timer.Reset(currentInterval)
 		}
 	}
+}
+
+// bumpInterval doubles the current interval, capped at max. Called
+// on every adapter error so a sustained outage backs off to 5
+// minutes rather than hammering the provider every 10 seconds.
+func bumpInterval(base, current, max time.Duration) time.Duration {
+	next := current * 2
+	if next < base {
+		next = base // first failure: at least honour the baseline
+	}
+	if next > max {
+		return max
+	}
+	return next
 }
 
 // runOnce performs one polling cycle. Wrapped so the goroutine in
