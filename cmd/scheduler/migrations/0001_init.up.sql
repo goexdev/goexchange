@@ -189,7 +189,7 @@ INSERT INTO currencies (symbol, name, precision, min_withdraw, max_withdraw) VAL
 INSERT INTO trading_pairs (base, quote, min_qty, max_qty, price_precision, qty_precision) VALUES
     ('BTC', 'USDT', 0.00001, 100, 2, 8),
     ('ETH', 'USDT', 0.0001, 1000, 2, 6),
-    ('BNB', 'USDT', 0.001, 10000, 2, 6),
+    ('BNB', 'USDT', 0.001, 10000, 2, 6);
 
 -- Mock state initial values
 INSERT INTO mock_state (key, value) VALUES

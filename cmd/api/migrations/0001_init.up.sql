@@ -183,13 +183,13 @@ INSERT INTO currencies (symbol, name, precision, min_withdraw, max_withdraw) VAL
     ('BTC', 'Bitcoin', 8, 0.0001, 100),
     ('ETH', 'Ethereum', 18, 0.001, 1000),
     ('BNB', 'Binance Coin', 18, 0.01, 10000),
-    ('USDT', 'Tether', 6, 1, 1000000),
+    ('USDT', 'Tether', 6, 1, 1000000);
 
 -- Trading pairs (base/quote)
 INSERT INTO trading_pairs (base, quote, min_qty, max_qty, price_precision, qty_precision) VALUES
     ('BTC', 'USDT', 0.00001, 100, 2, 8),
     ('ETH', 'USDT', 0.0001, 1000, 2, 6),
-    ('BNB', 'USDT', 0.001, 10000, 2, 6),
+    ('BNB', 'USDT', 0.001, 10000, 2, 6);
 
 -- Mock state initial values
 INSERT INTO mock_state (key, value) VALUES

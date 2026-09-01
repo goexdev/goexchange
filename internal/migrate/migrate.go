@@ -86,21 +86,40 @@ func (m *Migrator) Run(ctx context.Context, fs embed.FS, dir string) error {
 		return migrations[i].version < migrations[j].version
 	})
 
-	// 4. Get applied versions
-	applied := make(map[int64]bool)
-	rows, err := m.pool.Query(ctx, `SELECT version FROM schema_migrations WHERE dirty = false`)
-	if err != nil {
-		return fmt.Errorf("query applied: %w", err)
+	// 4. Determine the highest version that has been applied.
+	//
+	// schema_migrations follows the golang-migrate convention: a single
+	// row whose `version` column holds the highest migration that has
+	// fully run (dirty=false). A row with dirty=true means a previous
+	// migration attempt crashed mid-way and must be retried; any
+	// version greater than the highest clean row is still pending.
+	//
+	// Earlier revisions of this file queried every row and treated
+	// each as an independent "applied" flag; that broke once the
+	// golang-migrate CLI became the authoritative source on deploy-fresh
+	// runs, because the CLI only writes the single max-version row and
+	// leaves the rest implicit. As a result the embedded migrator would
+	// happily re-apply v1-v28 on every scheduler start and crash on
+	// "relation already exists".
+	var maxApplied int64
+	var maxDirty int64
+	if err := m.pool.QueryRow(ctx,
+		`SELECT
+			COALESCE(MAX(version) FILTER (WHERE dirty = false), 0),
+			COALESCE(MAX(version) FILTER (WHERE dirty = true), 0)
+		 FROM schema_migrations`).Scan(&maxApplied, &maxDirty); err != nil {
+		return fmt.Errorf("query max version: %w", err)
 	}
-	for rows.Next() {
-		var v int64
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan: %w", err)
-		}
+	if maxDirty > maxApplied {
+		return fmt.Errorf("schema_migrations is dirty at version %d; "+
+			"manual cleanup required (run `migrate -path migrations force <prev>` or "+
+			"DELETE FROM schema_migrations WHERE version = %d)",
+			maxDirty, maxDirty)
+	}
+	applied := make(map[int64]bool, maxApplied)
+	for v := int64(1); v <= maxApplied; v++ {
 		applied[v] = true
 	}
-	rows.Close()
 
 	// 5. Apply pending migrations
 	appliedCount := 0

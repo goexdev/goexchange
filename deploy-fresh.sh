@@ -257,6 +257,21 @@ log "=== Step 4: apply DB migrations ==="
 cd "$PUBLIC_DIR"
 MIGRATE_URL="postgres://${DB_USER}:${DB_PASS}@127.0.0.1:${DB_HOST_PORT}/${DB_NAME}?sslmode=disable"
 
+# Step 4a: sync the migrations/ tree to the embed directories used by
+# the api and scheduler binaries. Both binaries run their own embedded
+# migrator at startup (Go's internal/migrate/migrate.go reads from an
+# embed.FS rooted at ./migrations relative to their cmd directory), so
+# they MUST see the same set of up/down files that golang-migrate CLI
+# is about to apply. Without this sync the embedded migrator would
+# either skip missing versions (silently drifting from the DB) or
+# crash on missing ones.
+log "--- Step 4a: sync migrations/ -> cmd/{api,scheduler}/migrations/"
+cp "$PUBLIC_DIR/migrations/"*.up.sql   "$PUBLIC_DIR/cmd/api/migrations/"
+cp "$PUBLIC_DIR/migrations/"*.down.sql "$PUBLIC_DIR/cmd/api/migrations/"
+cp "$PUBLIC_DIR/migrations/"*.up.sql   "$PUBLIC_DIR/cmd/scheduler/migrations/"
+cp "$PUBLIC_DIR/migrations/"*.down.sql "$PUBLIC_DIR/cmd/scheduler/migrations/"
+ok "embedded migrations synced ($(ls "$PUBLIC_DIR/migrations/" | wc -l) files each)"
+
 # Install golang-migrate if missing
 if ! command -v migrate >/dev/null 2>&1; then
     warn "installing golang-migrate..."
@@ -299,21 +314,11 @@ ok "database $DB_NAME (re)created empty"
 migrate -path migrations -database "$MIGRATE_URL" up
 ok "migrations applied (public repo)"
 
-# The scheduler binary carries its own embedded migrations under
-# cmd/scheduler/migrations/ — the same schema as the public repo, just
-# a subset. After the public migrations ran, every CREATE TABLE the
-# scheduler would try to apply already exists, so without this hint
-# the scheduler's embedded migrator dies on 'relation already exists'.
-# We pre-mark every scheduler migration as already applied so its
-# idempotency check skips them on a fresh deploy.
-SCHED_VERSIONS=$(ls "$PUBLIC_DIR/cmd/scheduler/migrations/"*.up.sql 2>/dev/null \
-    | sed 's|.*/||' | grep -oE '^[0-9]+' | sort -n | uniq)
-for v in $SCHED_VERSIONS; do
-    PGPASSWORD="$DB_PASS" psql -h 127.0.0.1 -p "$DB_HOST_PORT" -U "$DB_USER" -d "$DB_NAME" \
-        -c "INSERT INTO schema_migrations (version, dirty) VALUES ($v, false) \
-            ON CONFLICT (version) DO UPDATE SET dirty = false;" >/dev/null 2>&1 || true
-done
-ok "scheduler migration set pre-marked as already applied"
+# The api and scheduler binaries each embed a copy of the public
+# migrations/ tree under cmd/api/migrations/ and cmd/scheduler/migrations/
+# so they can run their own embedded migrator at startup. The sync is
+# performed by Step 4a above; nothing to pre-mark here because both
+# binaries see the same 1-29 set that golang-migrate just applied.
 
 # ============================================================================
 # Step 5: build API + scheduler
