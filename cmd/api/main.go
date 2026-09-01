@@ -328,7 +328,18 @@ func run() error {
 	matchingClient := matching.NewClient(cfg.Matcher.URL, log)
 	tradingSvc := trading.NewService(pool, matching.NewOrderSourceAdapter(matchingClient), walletSvc, log)
 	marketDataSvc := marketdata.NewService(marketdata.NewMatcherAdapter(matchingClient), log)
-	marketDataSvc.SetPairs(cfg.ChainWatcher.Pairs)
+	// Seed the marketdata pair cache from the trading service (which
+	// reads trading_pairs from the DB at startup). Falling back to
+	// cfg.ChainWatcher.Pairs kept the cache empty in production where
+	// that section is not present in config.yaml.
+	var pc []config.PairConfig
+	for _, ep := range tradingSvc.EnabledPairs() {
+		pc = append(pc, config.PairConfig{Base: ep.Base, Quote: ep.Quote, Enabled: ep.Enabled})
+	}
+	if pc == nil {
+		pc = cfg.ChainWatcher.Pairs
+	}
+	marketDataSvc.SetPairs(pc)
 
 	// Notifier setup (must be before chainwatcher.New which uses it)
 	nlog := log.With("component", "notifier")

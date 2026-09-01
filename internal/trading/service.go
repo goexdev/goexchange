@@ -114,6 +114,35 @@ func (s *Service) ListPairs() []PairInfo {
 	return out
 }
 
+// EnabledPair represents a (base, quote) tuple that the trading
+// service considers tradable. Returned by EnabledPairs() and consumed
+// by MarketDataSvc to seed its in-memory pair cache. The struct lives
+// here (rather than in internal/config) to keep the trading package
+// free of a config import — config is the top-level settings package,
+// trading is a service that should compile independently of how the
+// operator chose to express its configuration.
+type EnabledPair struct {
+	Base    string
+	Quote   string
+	Enabled bool
+}
+
+// EnabledPairs returns every (base, quote) tuple currently enabled.
+// loadPairs only inserts rows where enabled=TRUE, so every entry here
+// has Enabled=true; the field is kept for callers that pass the result
+// straight into config-shaped code (MarketDataSvc does).
+func (s *Service) EnabledPairs() []EnabledPair {
+	out := make([]EnabledPair, 0, len(s.pairs))
+	for k := range s.pairs {
+		parts := strings.SplitN(k, "_", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		out = append(out, EnabledPair{Base: parts[0], Quote: parts[1], Enabled: true})
+	}
+	return out
+}
+
 // PlaceOrderInput is the data needed to place a new order.
 // STPMode is the Self-Trade Prevention mode for an order.
 type STPMode string

@@ -43,10 +43,24 @@ CORE_DIR="/root/${REPO_NAME}-core"
 GO_BIN="/usr/local/go/bin/go"
 export PATH="/usr/local/go/bin:/root/go/bin:$PATH"
 
-# Database — password is hard-coded in the compose container as
-# `exchange`; the public repo's config.yaml expects the same.
+# Source .env early so DB_PASS / POSTGRES_PASSWORD reflect whatever the
+# operator has committed / written locally (compose reads the same value
+# to start postgres). Without this every value below would lock to the
+# default `exchange` and DROP DATABASE later in the script would fail
+# with "password authentication failed" because compose is already
+# running postgres with the rotated password from .env.
+if [ -f "$PUBLIC_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$PUBLIC_DIR/.env"
+    set +a
+fi
+
+# Database — password defaults to "exchange" (the compose default). If
+# the operator wrote a POSTGRES_PASSWORD into .env above, that takes
+# precedence.
 DB_USER="exchange"
-DB_PASS="exchange"
+DB_PASS="${POSTGRES_PASSWORD:-exchange}"
 DB_NAME="exchange"
 DB_CONTAINER="goexchange-postgres"
 DB_HOST_PORT="5433"   # compose 5432 → host 5433
@@ -171,6 +185,23 @@ ok "matching image built: $MATCHING_IMAGE"
 # ============================================================================
 log "=== Step 3: docker compose up (shared services + matching) ==="
 
+# Source .env so DB_PASS / POSTGRES_PASSWORD match what compose will use
+# to start the postgres container. Without this, the password baked into
+# compose's container env differs from what deploy-fresh passes to psql,
+# and the DROP DATABASE in Step 4 fails with "password authentication
+# failed". The .env file may not exist yet on a truly first run; in that
+# case the default POSTGRES_PASSWORD=exchange (matching the compose
+# default) is used.
+if [ -f "$PUBLIC_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$PUBLIC_DIR/.env"
+    set +a
+    ok "loaded .env into shell (POSTGRES_PASSWORD set)"
+else
+    warn "no .env found; using defaults"
+fi
+
 cd "$PUBLIC_DIR"
 docker compose up -d postgres redis vault mailhog prometheus grafana
 # matching depends on postgres being healthy, so bring it up separately
@@ -229,25 +260,36 @@ else
             || warn "vault seed reported errors; check output above (continuing — dev stack still works)"
 
         # After seeding, if approle auth is configured, mint a
-        # fresh secret_id and overwrite VAULT_TOKEN in .env. The
-        # previous secret_id may have expired (24h TTL by
-        # default) so any post-deploy API restart would otherwise
-        # fail auth. We only run this on dev where auth_method
-        # matches the static root token we used for seeding.
-        if [ "${VAULT_AUTH_METHOD:-approle}" = "approle" ]; then
-            SECRET_ID=$(VAULT_ADDR="$VAULT_ADDR" \
-                VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}" \
-                vault write -f -field=secret_id \
-                auth/approle/role/goexchange/secret-id 2>/dev/null || echo "")
-            if [ -n "$SECRET_ID" ] && [ -f "$PUBLIC_DIR/.env" ]; then
-                sed -i "s|^VAULT_TOKEN=.*|VAULT_TOKEN=$SECRET_ID|" "$PUBLIC_DIR/.env"
-                ok "approle secret_id rotated and written to .env"
-            else
-                warn "approle secret_id rotation failed (continuing — API may need manual restart after secret_id expires)"
+                # fresh role_id + secret_id and write them into .env. The
+                # previous secret_id may have expired (24h TTL by default)
+                # and the role_id belongs to a freshly initialized Vault
+                # (dev mode wipes state on container restart), so any
+                # post-deploy API restart would otherwise fail with "invalid
+                # role or secret ID". config.go maps VAULT_TOKEN to
+                # AppSecretID and VAULT_ROLE_ID to AppRoleID when present.
+                if [ "${VAULT_AUTH_METHOD:-approle}" = "approle" ]; then
+                    SECRET_ID=$(VAULT_ADDR="$VAULT_ADDR" \
+                        VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}" \
+                        vault write -f -field=secret_id \
+                        auth/approle/role/goexchange/secret-id 2>/dev/null || echo "")
+                    ROLE_ID=$(VAULT_ADDR="$VAULT_ADDR" \
+                        VAULT_TOKEN="${VAULT_TOKEN:-please_change_me}" \
+                        vault read -field=role_id \
+                        auth/approle/role/goexchange/role-id 2>/dev/null || echo "")
+                    if [ -n "$SECRET_ID" ] && [ -n "$ROLE_ID" ] && [ -f "$PUBLIC_DIR/.env" ]; then
+                        sed -i "s|^VAULT_TOKEN=.*|VAULT_TOKEN=$SECRET_ID|" "$PUBLIC_DIR/.env"
+                        if grep -q "^VAULT_ROLE_ID=" "$PUBLIC_DIR/.env"; then
+                            sed -i "s|^VAULT_ROLE_ID=.*|VAULT_ROLE_ID=$ROLE_ID|" "$PUBLIC_DIR/.env"
+                        else
+                            echo "VAULT_ROLE_ID=$ROLE_ID" >> "$PUBLIC_DIR/.env"
+                        fi
+                        ok "approle role_id + secret_id rotated and written to .env"
+                    else
+                        warn "approle credentials rotation failed (continuing - API may need manual restart)"
+                    fi
+                fi
             fi
         fi
-    fi
-fi
 
 # ============================================================================
 # Step 4: run migrations

@@ -123,7 +123,7 @@ services:
     container_name: goexchange-matching
     environment:
       GRPC_ADDR: ":50051"
-      DATABASE_URL: postgres://exchange:exchange@postgres:5432/exchange?sslmode=disable
+      DATABASE_URL: "postgres://exchange:${POSTGRES_PASSWORD:-exchange}@postgres:5432/exchange?sslmode=disable"
     depends_on:
       postgres:
         condition: service_healthy
