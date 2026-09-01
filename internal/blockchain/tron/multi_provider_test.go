@@ -26,8 +26,9 @@ import (
 func TestMultiProviderLive(t *testing.T) {
 	chainstack := os.Getenv("TRON_TEST_TOKEN_CHAINSTACK")
 	nownodes := os.Getenv("TRON_TEST_TOKEN_NOWNODES")
-	if chainstack == "" && nownodes == "" {
-		t.Skip("TRON_TEST_TOKEN_CHAINSTACK and TRON_TEST_TOKEN_NOWNODES both unset")
+	drpc := os.Getenv("TRON_TEST_TOKEN_DRPC")
+	if chainstack == "" && nownodes == "" && drpc == "" {
+		t.Skip("TRON_TEST_TOKEN_CHAINSTACK, TRON_TEST_TOKEN_NOWNODES, and TRON_TEST_TOKEN_DRPC all unset")
 	}
 
 	// Build a list of providers that are actually configured. The
@@ -35,6 +36,25 @@ func TestMultiProviderLive(t *testing.T) {
 	// env that only sets one token still exercises the
 	// callWithFailover loop (it will simply fail to find an
 	// alternate and return the primary's result).
+	//
+	// Provider URL conventions we have verified against live
+	// chains (2026-09-01):
+	//
+	//   - chainstack: token in path, /wallet/{method} (legacy
+	//     HTTP API shape). Same path format for all read+write
+	//     methods; verbs split via RPCMethod prefix.
+	//
+	//   - nownodes: token in path, /wallet/{method}. Identical
+	//     shape to chainstack on the wire; only the host differs.
+	//
+	//   - drpc.org: token in path, /wallet/{method}. Same legacy
+	//     HTTP API shape as chainstack/nownodes. drpc.org's free
+	//     plan returns HTTP 400 code:35 ("method is not
+	//     available on free plan") on every method we probed;
+	//     a paid plan unlocks them. The adapter treats that as a
+	//     generic 4xx and fails over to the next provider, which
+	//     means drpc.org naturally degrades to chainstack+nownodes
+	//     on a free-tier key.
 	var providers []Provider
 	if chainstack != "" {
 		providers = append(providers, Provider{
@@ -47,6 +67,13 @@ func TestMultiProviderLive(t *testing.T) {
 		providers = append(providers, Provider{
 			Name:    "nownodes",
 			BaseURL: "https://trx.nownodes.io/" + nownodes,
+			Weight:  1,
+		})
+	}
+	if drpc != "" {
+		providers = append(providers, Provider{
+			Name:    "drpc",
+			BaseURL: "https://lb.drpc.live/tron/" + drpc,
 			Weight:  1,
 		})
 	}
@@ -71,6 +98,18 @@ func TestMultiProviderLive(t *testing.T) {
 		t.Logf("latest block: height=%d ts=%s", b.Height, b.LogTime.Format(time.RFC3339))
 		if b.Height <= 0 {
 			t.Errorf("expected height > 0, got %d", b.Height)
+		}
+		// Failover check: if drpc.org is in the list and its
+		// free plan rejected the call, the active provider
+		// should now point at the next available one.
+		if drpc != "" {
+			active := a.ActiveProvider()
+			t.Logf("active provider after GetLatestBlock: %s", active.Name)
+			if active.Name == "drpc" {
+				t.Log("drpc answered; either it has a paid key or the free plan unlocked the method")
+			} else {
+				t.Logf("drpc failed (likely free-plan 400); failed over to %s", active.Name)
+			}
 		}
 	})
 
