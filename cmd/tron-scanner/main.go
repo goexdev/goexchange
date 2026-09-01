@@ -258,6 +258,20 @@ func runOnce(
 					if err := saveCursor(ctx, pool, "TRON", scanner.GetCursor()); err != nil {
 						log.Warn("cursor save failed", "error", err)
 					}
+					// After fresh deposits are inserted, walk
+					// the PENDING table and promote rows whose
+					// block has enough confirmations on top.
+					// confirmAndCredit is read-only on the RPC
+					// (GetLatestBlock) so it does not amplify
+					// the rate-limit pressure from the
+					// scanner's own calls.
+					confirmed, credited, err := confirmAndCredit(ctx, pool, adapter, log)
+					if err != nil {
+						log.Warn("confirm/credit pass failed", "error", err)
+					} else if confirmed > 0 || credited > 0 {
+						log.Info("deposit promotion pass",
+							"confirmed", confirmed, "credited", credited)
+					}
 					log.Info("scan tick ok", "events", events, "persisted", persisted)
 					return nil
 				}
@@ -271,6 +285,140 @@ func runOnce(
 			persisted++
 		}
 	}
+}
+
+// confirmThreshold is the number of blocks on top of a deposit's
+// block before we promote PENDING -> CONFIRMED. TRON finalized
+// in ~1 minute historically (19 blocks at 3s/block); 19 is the
+// common exchange choice. Lower numbers make deposits
+// available faster but expose the user to a chain reorg
+// window; higher numbers are safer but slower.
+const confirmThreshold = 19
+
+// confirmAndCredit walks the deposits table once per scan tick
+// and:
+//
+//   1. Promotes PENDING rows whose block has >= confirmThreshold
+//      blocks on top to CONFIRMED, updating confirmations and
+//      confirmed_at.
+//   2. Promotes CONFIRMED rows to CREDITED, atomically inserting
+//      the matching amount into balances (available) for the
+//      user/asset pair.
+//
+// Both promotions are conditional UPDATEs so a row that gets
+// touched by two scanner instances simultaneously is safe —
+// only one wins, the other sees zero rows updated.
+func confirmAndCredit(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	adapter blockchain.Adapter,
+	log *slog.Logger,
+) (int, int, error) {
+	// Step 1: PENDING -> CONFIRMED.
+	//
+	// We need the chain's current block height to compute
+	// confirmations. callWithFailover in the adapter will walk
+	// providers, so a single rate-limited chainstack does not
+	// pin the whole pipeline.
+	head, err := adapter.GetLatestBlock(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("get latest block: %w", err)
+	}
+	ct, err := pool.Exec(ctx, `
+		UPDATE deposits
+		SET status = 'CONFIRMED',
+		    confirmations = LEAST(confirmations, $1::bigint - block_number),
+		    confirmed_at = COALESCE(confirmed_at, NOW())
+		WHERE status = 'PENDING'
+		  AND block_number IS NOT NULL
+		  AND block_number <= $1::bigint - $2`,
+		int64(head.Height), int64(confirmThreshold),
+	)
+	if err != nil {
+		return 0, 0, fmt.Errorf("promote pending->confirmed: %w", err)
+	}
+	confirmed := int(ct.RowsAffected())
+
+	// Step 2: CONFIRMED -> CREDITED + ledger update.
+	//
+	// We do this in one transaction per deposit so a partial
+	// failure leaves no half-credited rows. The query picks
+	// CONFIRMED rows that have not yet been credited and
+	// updates them in place while inserting a balances row.
+	//
+	// We rely on deposits.user_id and deposits.asset being
+	// already validated by the persistEvent path; the unique
+	// (chain, tx_hash, event_index) constraint prevents double
+	// credit on a re-scan.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return int(confirmed), 0, fmt.Errorf("begin credit tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, user_id, asset, amount
+		FROM deposits
+		WHERE status = 'CONFIRMED'
+		  AND credited_at IS NULL
+		LIMIT 100
+		FOR UPDATE SKIP LOCKED`)
+	if err != nil {
+		return int(confirmed), 0, fmt.Errorf("select confirmed: %w", err)
+	}
+	type creditRow struct {
+		id     uuid.UUID
+		userID uuid.UUID
+		asset  string
+		amount string // numeric -> string to preserve precision
+	}
+	var pending []creditRow
+	for rows.Next() {
+		var r creditRow
+		if err := rows.Scan(&r.id, &r.userID, &r.asset, &r.amount); err != nil {
+			rows.Close()
+			return int(confirmed), 0, fmt.Errorf("scan confirmed row: %w", err)
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return int(confirmed), 0, fmt.Errorf("iterate confirmed: %w", err)
+	}
+
+	credited := 0
+	for _, r := range pending {
+		// Upsert into balances. The CHECK constraint on
+		// balances.available ensures we never go negative;
+		// ON CONFLICT increments the existing row.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO balances (user_id, asset, available, frozen, updated_at)
+			VALUES ($1, $2, $3::numeric, 0, NOW())
+			ON CONFLICT (user_id, asset) DO UPDATE
+			SET available = balances.available + EXCLUDED.available,
+			    updated_at = NOW()`,
+			r.userID, r.asset, r.amount); err != nil {
+			return int(confirmed), credited, fmt.Errorf("credit balance for deposit %s: %w", r.id, err)
+		}
+		// Mark deposit as credited.
+		if _, err := tx.Exec(ctx, `
+			UPDATE deposits
+			SET status = 'CREDITED', credited_at = NOW()
+			WHERE id = $1 AND status = 'CONFIRMED'`, r.id); err != nil {
+			return int(confirmed), credited, fmt.Errorf("mark deposit %s credited: %w", r.id, err)
+		}
+		credited++
+		log.Info("deposit credited",
+			"deposit_id", r.id,
+			"user_id", r.userID,
+			"asset", r.asset,
+			"amount", r.amount,
+		)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return int(confirmed), credited, fmt.Errorf("commit credit tx: %w", err)
+	}
+	return int(confirmed), credited, nil
 }
 
 // persistEvent writes one Transfer event as a deposit row. The
@@ -314,16 +462,20 @@ func persistEvent(
 
 	// 2. Insert into deposits with the idempotency key
 	//    (chain, tx_hash, event_index). ON CONFLICT DO NOTHING so
-	//    a re-poll of the same block is a no-op.
+	//    a re-poll of the same block is a no-op. block_number
+	//    is required by the confirm/credit pass; it stays NULL
+	//    only if the scanner's BlockNum field is zero, which is
+	//    a bug we want to surface via the logs.
 	_, err = pool.Exec(ctx, `
 		INSERT INTO deposits (
 			id, user_id, asset, chain, amount, tx_hash,
-			from_address, to_address, confirmations, status
+			from_address, to_address, confirmations, status,
+			block_number
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PENDING')
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PENDING', $9)
 		ON CONFLICT (chain, tx_hash, event_index) DO NOTHING`,
 		uuid.New(), userID, asset, e.Chain, e.Amount, e.TxHash,
-		e.From, e.To)
+		e.From, e.To, int64(e.BlockNum))
 	if err != nil {
 		return fmt.Errorf("insert deposit: %w", err)
 	}
