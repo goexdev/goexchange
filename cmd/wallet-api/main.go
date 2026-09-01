@@ -113,8 +113,7 @@ func main() {
 	// failover; with neither set we skip the real adapter so the
 	// wallet-api still boots (registry stubs handle the rest).
 	registry := blockchain.NewRegistry()
-	tronAd, err := buildTronAdapter(os.Getenv("TRON_PRIMARY_URL"), os.Getenv("TRON_PRIMARY_KEY"),
-		os.Getenv("TRON_BACKUP_URL"), os.Getenv("TRON_BACKUP_KEY"), log)
+	tronAd, err := buildTronAdapter(log)
 	if err != nil {
 		log.Warn("tron adapter init failed (RPC URLs missing); wallet-api will use registry fallback", "error", err)
 	} else {
@@ -645,35 +644,95 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 // Ensure unused imports do not trip build when the file grows.
 var _ = fmt.Sprintf
 
-// buildTronAdapter assembles a TRON adapter from the four
-// TRON_PRIMARY_URL/PRIMARY_KEY/BACKUP_URL/BACKUP_KEY env vars.
-// Either side of the primary/backup pair is optional; we omit the
-// empty one entirely so a single-provider deploy does not get
-// spurious "falling back" log noise.
+// buildTronAdapter assembles a TRON adapter from TRON provider
+// environment variables. We accept two layouts:
 //
-// Names default to "primary" / "backup" so the admin /metrics
-// endpoints have something stable to label; production deployments
-// can override by exporting TRON_PRIMARY_NAME / TRON_BACKUP_NAME.
-func buildTronAdapter(primaryURL, primaryKey, backupURL, backupKey string, log *slog.Logger) (*tronadapter.Adapter, error) {
+//  1. The legacy two-provider form, kept for backwards
+//     compatibility with deploy-fresh.sh and existing .env files:
+//       TRON_PRIMARY_URL, TRON_PRIMARY_KEY,
+//       TRON_BACKUP_URL,  TRON_BACKUP_KEY,
+//       TRON_PRIMARY_NAME, TRON_BACKUP_NAME (optional).
+//
+//  2. The generic N-provider form:
+//       TRON_PROVIDER_<NAME>_URL
+//       TRON_PROVIDER_<NAME>_KEY  (optional)
+//     where <NAME> is the provider label we expose to the admin
+//     RPC switch endpoint. Examples:
+//       TRON_PROVIDER_CHAINSTACK_URL=https://.../chainstack/<token>/wallet
+//       TRON_PROVIDER_NOWNODES_URL=https://.../nownodes/<token>/wallet
+//       TRON_PROVIDER_DWELLIR_URL=https://.../dwellir/<token>/wallet
+//     Providers are appended to the slice in alphabetical name
+//     order, so the highest priority is whichever name sorts
+//     first. To control priority without renaming, set
+//     TRON_PROVIDER_<NAME>_WEIGHT (defaults to 1).
+//
+// When both forms are set the legacy form contributes its
+// (possibly empty) entries first and the generic form is appended,
+// so callers who migrate from primary/backup to a per-name scheme
+// can do it incrementally.
+func buildTronAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
 	var providers []tronadapter.Provider
-	if primaryURL != "" {
+
+	// Legacy two-provider form. Empty URL means "not configured"
+	// and the entry is skipped, so a single-provider deploy works.
+	if url := os.Getenv("TRON_PRIMARY_URL"); url != "" {
 		providers = append(providers, tronadapter.Provider{
 			Name:    envOr("TRON_PRIMARY_NAME", "primary"),
-			BaseURL: primaryURL,
-			APIKey:  primaryKey,
-			Weight:  1,
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
+			Weight:  envInt("TRON_PRIMARY_WEIGHT", 1),
 		})
 	}
-	if backupURL != "" {
+	if url := os.Getenv("TRON_BACKUP_URL"); url != "" {
 		providers = append(providers, tronadapter.Provider{
 			Name:    envOr("TRON_BACKUP_NAME", "backup"),
-			BaseURL: backupURL,
-			APIKey:  backupKey,
-			Weight:  1, // equal weight to primary; admins adjust via future config
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
+			Weight:  envInt("TRON_BACKUP_WEIGHT", 1),
 		})
 	}
+
+	// Generic N-provider form. We scan the environment for
+	// TRON_PROVIDER_*_URL variables and emit one Provider per
+	// match. Names are case-preserved (admin switch uses them
+	// case-sensitively) but the sort below is case-insensitive
+	// so "Chainstack" and "chainstack" do not double-register.
+	providerCount := 0
+	for _, kv := range os.Environ() {
+		// kv is "KEY=VALUE"; we want only the KEY part. Earlier
+		// versions of this loop checked strings.HasSuffix(kv,
+		// "_URL") on the whole entry, which fails because the
+		// value (URL) does not end with _URL. Splitting first
+		// and checking the KEY is the correct test.
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		key := kv[:eq]
+		const prefix = "TRON_PROVIDER_"
+		const suffix = "_URL"
+		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+			continue
+		}
+		name := strings.ToLower(key[len(prefix) : len(key)-len(suffix)])
+		url := kv[eq+1:]
+		if name == "" {
+			continue
+		}
+		if url == "" {
+			continue
+		}
+		providerCount++
+		providers = append(providers, tronadapter.Provider{
+			Name:    name,
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_PROVIDER_" + name + "_KEY"),
+			Weight:  envInt("TRON_PROVIDER_"+name+"_WEIGHT", 1),
+		})
+	}
+
 	if len(providers) == 0 {
-		return nil, errors.New("no TRON providers configured (set TRON_PRIMARY_URL or TRON_BACKUP_URL)")
+		return nil, errors.New("no TRON providers configured (set TRON_PRIMARY_URL or any TRON_PROVIDER_<name>_URL)")
 	}
 	return tronadapter.NewAdapter(tronadapter.Config{
 		Providers: providers,
@@ -686,4 +745,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt parses an env var as int with a default. Returns def on
+// empty or unparseable values rather than panicking, so a typo
+// in the operator's .env does not bring down the wallet-api.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }

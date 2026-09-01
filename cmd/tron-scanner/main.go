@@ -372,40 +372,83 @@ func contractForAsset(asset string) string {
 }
 
 func buildAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
-	primaryURL := os.Getenv("TRON_PRIMARY_URL")
-	backupURL := os.Getenv("TRON_BACKUP_URL")
-	if primaryURL == "" && backupURL == "" {
-		return nil, errors.New("TRON_PRIMARY_URL or TRON_BACKUP_URL must be set")
-	}
-	// If only one of the two is set, mirror it on the other side
-	// so a single-provider deploy does not get spurious "falling
-	// back" log noise. The adapter is happy to deduplicate; the
-	// cost is one extra map lookup per request.
-	if primaryURL == "" {
-		primaryURL = backupURL
-	}
-	if backupURL == "" {
-		backupURL = primaryURL
-	}
-	providers := []tronadapter.Provider{
-		{
-			Name:    envOr("TRON_PRIMARY_NAME", "primary"),
-			BaseURL: primaryURL,
-			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
-			Weight:  1,
-		},
-		{
-			Name:    envOr("TRON_BACKUP_NAME", "backup"),
-			BaseURL: backupURL,
-			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
-			Weight:  1,
-		},
+	// Tron-scanner uses the same N-provider form as cmd/wallet-api.
+	// See that function's doc comment for the full env-var spec;
+	// the scanner copy lives here so each binary's main package
+	// stays self-contained. Network is fixed to mainnet because
+	// the scanner does not yet support a nile-testnet config;
+	// the wallet-api reads Network from its own Config.
+	providers := scanProvidersFromEnv()
+	if len(providers) == 0 {
+		return nil, errors.New("no TRON providers configured (set TRON_PRIMARY_URL or any TRON_PROVIDER_<name>_URL)")
 	}
 	return tronadapter.NewAdapter(tronadapter.Config{
 		Providers: providers,
 		Logger:    log,
 		Network:   tronadapter.NetworkMainnet,
 	})
+}
+
+// scanProvidersFromEnv builds a Provider slice from the same env
+// vars cmd/wallet-api reads. Kept as a helper rather than a
+// shared package because the two binaries can disagree on minor
+// fields (e.g. network) without forcing a shared dependency.
+//
+// Returns an empty slice when no provider is configured; the
+// caller is expected to surface that as an error.
+func scanProvidersFromEnv() []tronadapter.Provider {
+	var providers []tronadapter.Provider
+
+	// Legacy two-provider form.
+	if url := os.Getenv("TRON_PRIMARY_URL"); url != "" {
+		providers = append(providers, tronadapter.Provider{
+			Name:    envOr("TRON_PRIMARY_NAME", "primary"),
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
+			Weight:  1,
+		})
+	}
+	if url := os.Getenv("TRON_BACKUP_URL"); url != "" {
+		providers = append(providers, tronadapter.Provider{
+			Name:    envOr("TRON_BACKUP_NAME", "backup"),
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
+			Weight:  1,
+		})
+	}
+
+	// Generic N-provider form.
+	for _, kv := range os.Environ() {
+		// kv is "KEY=VALUE"; we want only the KEY part. Earlier
+		// versions of this loop checked strings.HasSuffix on
+		// the whole "KEY=VALUE" entry, which fails because the
+		// value (URL) does not end with _URL.
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		key := kv[:eq]
+		const prefix = "TRON_PROVIDER_"
+		const suffix = "_URL"
+		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+			continue
+		}
+		name := strings.ToLower(key[len(prefix) : len(key)-len(suffix)])
+		url := kv[eq+1:]
+		if name == "" {
+			continue
+		}
+		if url == "" {
+			continue
+		}
+		providers = append(providers, tronadapter.Provider{
+			Name:    name,
+			BaseURL: url,
+			APIKey:  os.Getenv("TRON_PROVIDER_" + name + "_KEY"),
+			Weight:  1,
+		})
+	}
+	return providers
 }
 
 func envOr(key, def string) string {
