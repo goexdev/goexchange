@@ -169,7 +169,7 @@ func (s *Service) pollDeposits(ctx context.Context) error {
 	// Get all assigned addresses from DB
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.address, a.user_id
-		FROM assigned_addresses a
+		FROM wallet_addresses a
 		JOIN users u ON a.user_id = u.id
 		JOIN chains c ON a.chain = c.name
 		WHERE c.driver = $1
@@ -652,7 +652,7 @@ func (s *Service) GetDepositAddress(ctx context.Context, userID uuid.UUID, asset
 	// under a sibling chain and risk inserting a duplicate.
 	var addr string
 	err := s.pool.QueryRow(ctx, `
-		SELECT address FROM assigned_addresses
+		SELECT address FROM wallet_addresses
 		WHERE user_id = $1 AND asset = $2
 		LIMIT 1
 	`, userID, asset).Scan(&addr)
@@ -687,7 +687,7 @@ func (s *Service) AllocateAddress(ctx context.Context, userID uuid.UUID, asset s
 	}
 	chain := s.chainForAsset(asset)
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO assigned_addresses (user_id, address, chain, asset, exp_time, memo)
+		INSERT INTO wallet_addresses (user_id, address, chain, asset, exp_time, memo)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`, userID, addr, chain, asset, "2099-12-31 00:00:00+00", "self-allocated")
 	if err != nil {
@@ -750,7 +750,7 @@ func (s *Service) GetPendingDeposits(ctx context.Context, userID uuid.UUID) ([]*
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.address, COALESCE(a.asset, '')
-		FROM assigned_addresses a
+		FROM wallet_addresses a
 		WHERE a.user_id = $1
 	`, userID)
 	if err != nil {
@@ -800,7 +800,7 @@ func (s *Service) ImportDepositsFromChain(ctx context.Context, userID uuid.UUID)
 	// Get user addresses
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.address, COALESCE(a.asset, 'BTC')
-		FROM assigned_addresses a
+		FROM wallet_addresses a
 		WHERE a.user_id = $1
 	`, userID)
 	if err != nil {
@@ -882,7 +882,7 @@ func (s *Service) GetPendingTxs(ctx context.Context, userID uuid.UUID) ([]*Pendi
 	// Get all assigned addresses for user
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.address, COALESCE(a.asset, 'BTC')
-		FROM assigned_addresses a
+		FROM wallet_addresses a
 		WHERE a.user_id = $1
 	`, userID)
 	if err != nil {
