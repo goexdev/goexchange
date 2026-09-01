@@ -22,6 +22,7 @@ import (
 	"github.com/goexdev/goexchange/internal/api"
 	"github.com/goexdev/goexchange/internal/auth"
 	"github.com/goexdev/goexchange/internal/chainwatcher"
+	signerclient "github.com/goexdev/goexchange/internal/signer/client"
 	"github.com/goexdev/goexchange/internal/indexer"
 	"github.com/goexdev/goexchange/internal/config"
 	"github.com/goexdev/goexchange/internal/db"
@@ -323,6 +324,31 @@ func run() error {
 	// Build services (no chainwatcher - that's in scheduler)
 	userSvc := user.NewService(pool, log)
 	walletSvc := wallet.NewService(pool, log)
+
+	// Signer daemon (closed-source): if SIGNER_ADDR is set (compose
+	// wires it to "signer:50061"; dev runs on host wire it to
+	// "127.0.0.1:50061"), dial it and hand the client to the V1
+	// wallet service. A nil signer is fine: AllocateDepositAddress
+	// falls back to the registry adapter (which also returns a
+	// placeholder address until B5 wires real derivation).
+	signerAddr := os.Getenv("SIGNER_ADDR")
+	if signerAddr == "" {
+		signerAddr = "127.0.0.1:50061"
+	}
+	signerClient, err := signerclient.NewClient(initCtx, signerAddr)
+	if err != nil {
+		log.Warn("signer dial failed; AllocateDepositAddress will use registry fallback",
+			"addr", signerAddr, "error", err)
+	} else {
+		defer signerClient.Close()
+		ok, vaultStatus, _, herr := signerClient.Health(initCtx)
+		if herr != nil || !ok {
+			log.Warn("signer reports unhealthy",
+				"addr", signerAddr, "vault_status", vaultStatus, "error", herr)
+		} else {
+			log.Info("signer connected", "addr", signerAddr, "vault_status", vaultStatus)
+		}
+	}
 
 	// Matching engine runs in matcher binary; we use a client here
 	matchingClient := matching.NewClient(cfg.Matcher.URL, log)

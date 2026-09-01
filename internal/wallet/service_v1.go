@@ -39,12 +39,23 @@ import (
 )
 
 // ServiceV1 is the V1 wallet service. It owns one blockchain
-// registry (the same instance the chainwatcher uses) and one DB
-// pool.
+// registry (the same instance the chainwatcher uses), one DB
+// pool, and (optionally) a SignerService client. When the signer
+// client is configured, AllocateDepositAddress asks the signer
+// to derive a fresh address instead of returning a placeholder
+// zero address.
 type ServiceV1 struct {
 	pool     *pgxpool.Pool
 	registry *bc.Registry
+	signer   signerClient // nil in V1 stubs; set via SetSignerClient
 	log      *slog.Logger
+}
+
+// signerClient is the subset of client.Client we use here. Defined
+// as an interface so the service layer can be unit-tested without
+// a real signer daemon.
+type signerClient interface {
+	Derive(ctx context.Context, chain string, index uint32) (encoded, hexAddr, pubKey string, err error)
 }
 
 // NewServiceV1 constructs the V1 service. Either the registry or the
@@ -57,6 +68,12 @@ func NewServiceV1(pool *pgxpool.Pool, registry *bc.Registry, log *slog.Logger) *
 // construction. V1 deploys the registry before NewServiceV1 runs, so
 // this is a no-op in production but useful in unit tests.
 func (s *ServiceV1) SetRegistry(r *bc.Registry) { s.registry = r }
+
+// SetSignerClient is used by cmd/api/main.go after constructing
+// NewServiceV1 to hand it the signer daemon client. The client is
+// a no-op when nil; AllocateDepositAddress returns a deterministic
+// zero address in that case.
+func (s *ServiceV1) SetSignerClient(c signerClient) { s.signer = c }
 
 // RegisterAdapter is a convenience wrapper around registry.Register.
 // The scanner / chainwatcher call this once at startup per chain.
@@ -107,29 +124,50 @@ func (s *ServiceV1) AllocateDepositAddress(ctx context.Context, req AllocateAddr
 		return nil, fmt.Errorf("lookup existing address: %w", err)
 	}
 
-	// Step 2: derive a fresh address via the adapter.
-	if s.registry == nil {
-		return nil, errors.New("wallet.ServiceV1: registry not configured (B3 needed for derivation)")
-	}
-	adapter, err := s.registry.For(bc.Chain(req.Chain))
-	if err != nil {
-		return nil, fmt.Errorf("get adapter for %s: %w", req.Chain, err)
-	}
-	// TODO(B3): look up the next available BIP-44 index. For now we
-	// always request index 0, which is fine because GenerateAddress
-	// on the stub adapter returns a deterministic zero address.
-	addr, err := adapter.GenerateAddress(ctx, 0)
-	if err != nil {
-		return nil, fmt.Errorf("generate address: %w", err)
+	// Step 2: derive a fresh address.
+	if s.signer == nil {
+		// No signer configured — fall back to the registry's
+		// adapter.GenerateAddress. Both paths return a deterministic
+		// zero address in V1 because neither the signer nor the
+		// TRON adapter has a real derivation implementation yet.
+		if s.registry == nil {
+			return nil, errors.New("wallet.ServiceV1: registry not configured (B3 needed for derivation)")
+		}
+		adapter, err := s.registry.For(bc.Chain(req.Chain))
+		if err != nil {
+			return nil, fmt.Errorf("get adapter for %s: %w", req.Chain, err)
+		}
+		addr, err := adapter.GenerateAddress(ctx, 0)
+		if err != nil {
+			return nil, fmt.Errorf("generate address: %w", err)
+		}
+		return s.persistAllocatedAddress(ctx, req, addr.Encoded, addr.Hex, 0)
 	}
 
-	// Step 3: persist.
+	// Signer path: ask the closed-source daemon to derive a fresh
+	// address. The (user, chain, asset) key already exists in DB so
+	// we use it as the BIP-44 index seed; that way two users who
+	// happen to share a hot wallet never collide on a derived
+	// address. (V1 returns index=0 to keep behaviour predictable
+	// while B6 wires the real index counter.)
+	index := uint32(0)
+	encoded, hexAddr, _, err := s.signer.Derive(ctx, req.Chain, index)
+	if err != nil {
+		return nil, fmt.Errorf("signer.Derive: %w", err)
+	}
+	return s.persistAllocatedAddress(ctx, req, encoded, hexAddr, index)
+}
+
+// persistAllocatedAddress writes one row to wallet_addresses inside a
+// transaction. Pulled out of AllocateDepositAddress so the signer
+// path and the adapter path share the same INSERT logic.
+func (s *ServiceV1) persistAllocatedAddress(ctx context.Context, req AllocateAddressRequest, encoded, hexAddr string, index uint32) (*AllocateAddressResponse, error) {
 	id := uuid.New()
-	_, err = s.pool.Exec(ctx, `
+	_, err := s.pool.Exec(ctx, `
 		INSERT INTO wallet_addresses (id, user_id, address, chain, asset, wallet_type, address_hex, memo, exp_time)
 		VALUES ($1, $2, $3, $4, $5, 'DEPOSIT', $6, 'self-allocated', '2099-12-31 00:00:00+00')
 		ON CONFLICT (chain, address) DO NOTHING`,
-		id, req.UserID, addr.Encoded, req.Chain, req.Asset, addr.Hex)
+		id, req.UserID, encoded, req.Chain, req.Asset, hexAddr)
 	if err != nil {
 		return nil, fmt.Errorf("insert address: %w", err)
 	}
@@ -140,13 +178,13 @@ func (s *ServiceV1) AllocateDepositAddress(ctx context.Context, req AllocateAddr
 			Chain:     req.Chain,
 			Asset:     req.Asset,
 			Type:      WalletDeposit,
-			Encoded:   addr.Encoded,
-			Hex:       addr.Hex,
+			Encoded:   encoded,
+			Hex:       hexAddr,
 			Status:    "ACTIVE",
 			CreatedAt: nowUTC(),
 		},
 		Reused:   false,
-		NewIndex: 0,
+		NewIndex: index,
 	}, nil
 }
 

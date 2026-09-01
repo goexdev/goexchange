@@ -59,3 +59,4 @@ Dockerfile.bak
 # own notes; the rule below prevents them from being committed.
 docs/
 docs/**/.env.bak.*
+deploy/signer-token

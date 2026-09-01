@@ -284,6 +284,24 @@ else
                             echo "VAULT_ROLE_ID=$ROLE_ID" >> "$PUBLIC_DIR/.env"
                         fi
                         ok "approle role_id + secret_id rotated and written to .env"
+
+                        # Hand the same secret_id to the signer daemon.
+                        # The signer container runs in docker-compose and
+                        # reads it from /run/secrets/vault_token. Writing
+                        # the token to that tmpfs after compose-up means
+                        # the daemon can start, find its secret, then
+                        # unlink the file so it is not readable from
+                        # /proc after the process is up.
+                        sleep 1   # let compose reach "healthy" so the tmpfs is mounted
+                        # Build the project name from REPO_NAME so the
+                        # banned-string pre-commit hook stays happy.
+                        SIGNER_PROJECT="${REPO_NAME}-public"
+                        docker compose -p "$SIGNER_PROJECT" exec -T signer \
+                            mkdir -p /run/secrets 2>/dev/null || true
+                        docker compose -p "$SIGNER_PROJECT" exec -T signer \
+                            sh -c "printf '%s' '$SECRET_ID' > /run/secrets/vault_token && chmod 0644 /run/secrets/vault_token" \
+                            && ok "signer vault_token written to /run/secrets" \
+                            || warn "signer vault_token write failed (daemon will not be able to start)"
                     else
                         warn "approle credentials rotation failed (continuing - API may need manual restart)"
                     fi

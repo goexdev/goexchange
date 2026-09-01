@@ -137,6 +137,38 @@ services:
       start_period: 10s
       retries: 3
 
+  # Signer daemon (closed-source). Pulled from ghcr.io just like
+  # matching; the source lives in the private goexchange-core repo
+  # and is garble-built. The daemon never reaches the public
+  # internet; it only needs Vault (for the BIP-39 mnemonic) and the
+  # public-repository wallet-api (via the host-mapped gRPC port).
+  signer:
+    image: ghcr.io/goexdev/goexchange-signer:latest
+    container_name: goexchange-signer
+    environment:
+      LISTEN: ":50061"
+      VAULT: "http://vault:8200"
+      VAULT_TOKEN_FILE: "/run/secrets/vault_token"
+      CHAINS: "TRON"
+    volumes:
+      # The vault-token file is written by deploy-fresh.sh to a host
+      # path and bind-mounted here. The host file is gitignored; the
+      # daemon reads it at startup and keeps the mount in place so a
+      # container restart does not require re-running deploy-fresh.
+      - ./deploy/signer-token:/run/secrets/vault_token:ro
+    depends_on:
+      vault:
+        condition: service_healthy
+    ports:
+      - "50061:50061"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/50061 && exec 3<&-"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
 volumes:
   goexchange_pgdata:
   goexchange_redisdata:
