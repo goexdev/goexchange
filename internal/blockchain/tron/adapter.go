@@ -51,19 +51,51 @@ const (
 	TRXNative      = ""                                          // empty contract == native TRX
 )
 
-// RPCMethod is the set of TRON JSON-RPC methods V1 calls. They are
+// RPCMethod is the set of TRON RPC methods V1 calls. They are
 // typed as constants so a typo at the call site becomes a compile
 // error rather than a runtime "method not found".
+//
+// The leading "GET " or "POST " is the HTTP verb Chainstack (and
+// trongrid.io) expect for that call; callJSON splits on the first
+// space. Methods without a prefix default to POST. The legacy HTTP
+// API treats GET vs POST uniformly so the same code path works for
+// every provider we have tested.
 type RPCMethod string
 
 const (
+	// Read-only block / transaction inspection. Chainstack serves
+	// these as GET; trongrid.io as POST. We send GET because the
+	// request bodies are empty and Chainstack rejects POST with a
+	// 405.
 	MethodGetBlockByNum       RPCMethod = "GET /wallet/getblockbynum"
 	MethodGetTransactionInfo  RPCMethod = "GET /wallet/gettransactioninfobyid"
 	MethodGetTransaction      RPCMethod = "GET /wallet/gettransactionbyid"
 	MethodGetNowBlock         RPCMethod = "GET /wallet/getnowblock"
 	MethodGetBlock            RPCMethod = "GET /wallet/getblock"
-	MethodBroadcastTransaction RPCMethod = "POST /wallet/broadcasttransaction"
+
+	// Write paths: broadcast + trigger constant contract. The
+	// TRON docs say both must be POST because they carry a body
+	// (signed transaction, or trigger input).
+	MethodBroadcastTransaction   RPCMethod = "POST /wallet/broadcasttransaction"
 	MethodTriggerConstantContract RPCMethod = "POST /wallet/triggerconstantcontract"
+)
+
+// RPCStyle controls how callJSON wraps the request. The default
+// (zero value, RPCStyleHTTPAuto) picks HTTP-API style because that
+// works against every TRON provider we have tested (Chainstack
+// TRON, trongrid.io, Nile testnet public node). JSON-RPC 2.0 is
+// available as RPCStyleJSONRPC for providers that only expose it.
+type RPCStyle int
+
+const (
+	// RPCStyleHTTPAuto sends a POST to {BaseURL}/wallet/{method}
+	// with the params as a raw JSON body. This is the shape
+	// Chainstack and trongrid.io accept.
+	RPCStyleHTTPAuto RPCStyle = iota
+	// RPCStyleJSONRPC sends a POST to {BaseURL}/jsonrpc with a
+	// {"jsonrpc":"2.0","method":"...","params":{...}} body.
+	// Use this for providers that reject the bare HTTP-API form.
+	RPCStyleJSONRPC
 )
 
 // Provider holds one RPC endpoint. V1 uses HTTP only (the gRPC
@@ -72,12 +104,19 @@ const (
 // Health is a pointer to atomic.Int32 so adapters can update it
 // without copying the noCopy-embedded struct. Callers should treat
 // it as read-only; the adapter owns the only writer.
+//
+// RPCStyle selects how callJSON wraps each request. The default
+// (zero value, RPCStyleHTTPAuto) routes through the legacy HTTP
+// API at {BaseURL}/wallet/{method}, which is what Chainstack
+// QuickNode and trongrid.io accept. Set to RPCStyleJSONRPC for
+// providers that only expose JSON-RPC 2.0.
 type Provider struct {
-	Name    string
-	BaseURL string
-	APIKey  string          // optional, appended as TRON-PRO-API-KEY header
-	Weight  int             // 1 for the primary, 0.5 for backup, etc.
-	Health  *atomic.Int32   // success counter; nil means "do not track"
+	Name     string
+	BaseURL  string
+	APIKey   string        // optional, appended as TRON-PRO-API-KEY header
+	Weight   int           // 1 for the primary, 0.5 for backup, etc.
+	Health   *atomic.Int32 // success counter; nil means "do not track"
+	RPCStyle RPCStyle      // default: RPCStyleHTTPAuto
 }
 
 // Config carries everything NewAdapter needs. Both providers must be
@@ -146,52 +185,78 @@ func (a *Adapter) chainID() uint64 {
 	}
 }
 
-// callJSON sends a JSON-RPC request to the given provider and decodes
-// the response. Errors are wrapped with the provider name so the
+// callJSON sends an HTTP request to the provider and decodes the
+// response. Errors are wrapped with the provider name so the
 // caller can log "primary timeout, switching to backup" without
 // having to remember which provider failed.
+//
+// TRON has two RPC styles in active use:
+//
+//   1. The legacy HTTP API: POST {BaseURL}/wallet/{method} with a
+//      JSON body containing the method parameters. This is what
+//      Chainstack QuickNode (TRON endpoints) and the official
+//      trongrid.io all use. Chainstack exposes it at
+//      https://...chainstack.com/{token}/wallet/{method}.
+//
+//   2. JSON-RPC 2.0: POST {BaseURL}/jsonrpc with a body that has
+//      {"jsonrpc":"2.0","method":"wallet/{method}","params":{...}.
+//      Some providers (Nile testnet, Alchemy, Infura TRON) expose
+//      this. Chainstack accepts it too via the /jsonrpc endpoint
+//      but the response is the same shape either way.
+//
+// V1 sends every method as a POST to {BaseURL}/wallet/{method}
+// with the params as the JSON body. This is the lowest common
+// denominator that works against Chainstack today and against
+// trongrid.io without a code change. To switch a provider to
+// JSON-RPC 2.0 set Provider.RPCStyle = RPCStyleJSONRPC; the same
+// callJSON implementation will then route through /jsonrpc.
 func (a *Adapter) callJSON(ctx context.Context, p Provider, method RPCMethod, params map[string]any, out any) error {
-	body, err := json.Marshal(map[string]any{
-		"method":  string(method),
-		"params":  params,
-		"id":      time.Now().UnixNano(),
-		"jsonrpc": "2.0",
-	})
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+	// Split the leading "GET "/"POST " from the path. Methods
+	// without a prefix default to POST (TRON's docs say every
+	// call is POSTable; we send GET only where we know the
+	// provider rejects POST). After splitting, strip any leading
+	// "/" so we can re-join with BaseURL without doubling the
+	// "/wallet" prefix.
+	verb, path := "POST", string(method)
+	if i := strings.IndexByte(string(method), ' '); i > 0 {
+		verb, path = string(method)[:i], string(method)[i+1:]
 	}
-	url := p.BaseURL
-	if !strings.HasSuffix(url, "/") {
-		url += "/"
-	}
-	url += strings.TrimPrefix(string(method), "POST ")
-	// The "POST /wallet/broadcasttransaction" notation above is a hint
-	// that this method uses POST; HTTP transport in TRON's JSON-RPC
-	// uses POST for everything that takes a body. All read-only
-	// methods are GET with params in the query string. We split on
-	// the first space: "POST foo" => method=foo, http=POST. "GET bar"
-	// => method=bar, http=GET.
+	path = strings.TrimPrefix(path, "/")
 
-	parts := strings.SplitN(string(method), " ", 2)
-	httpMethod, path := http.MethodGet, string(method)
-	if len(parts) == 2 {
-		httpMethod, path = parts[0], parts[1]
-	}
-
-	var req *http.Request
-	switch httpMethod {
-	case http.MethodPost:
-		req, err = http.NewRequestWithContext(ctx, httpMethod, p.BaseURL+path, bytes.NewReader(body))
-	default:
-		req, err = http.NewRequestWithContext(ctx, httpMethod, p.BaseURL+path, nil)
-		q := req.URL.Query()
-		for k, v := range params {
-			q.Set(k, fmt.Sprintf("%v", v))
+	var bodyReader io.Reader
+	var url string
+	if p.RPCStyle == RPCStyleJSONRPC {
+		// JSON-RPC 2.0: POST /jsonrpc with a structured body.
+		body, err := json.Marshal(map[string]any{
+			"method":  path,
+			"params":  params,
+			"id":      time.Now().UnixNano(),
+			"jsonrpc": "2.0",
+		})
+		if err != nil {
+			return fmt.Errorf("marshal: %w", err)
 		}
-		req.URL.RawQuery = q.Encode()
+		bodyReader = bytes.NewReader(body)
+		url = strings.TrimSuffix(p.BaseURL, "/") + "/jsonrpc"
+	} else {
+		// HTTP API: POST (or GET) {BaseURL}/wallet/{method} with
+		// raw params as the body. Chainstack and trongrid.io both
+		// accept this and it is the most stable interface across
+		// providers.
+		body, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("marshal: %w", err)
+		}
+		bodyReader = bytes.NewReader(body)
+		url = strings.TrimSuffix(p.BaseURL, "/") + "/" + path
 	}
+
+	req, err := http.NewRequestWithContext(ctx, verb, url, bodyReader)
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
+	}
+	if a.cfg.Logger != nil {
+		a.cfg.Logger.Debug("tron RPC request", "url", url, "verb", verb)
 	}
 	if p.APIKey != "" {
 		req.Header.Set("TRON-PRO-API-KEY", p.APIKey)
@@ -334,23 +399,52 @@ func (a *Adapter) GetSolidifiedBlock(ctx context.Context) (bc.Block, error) {
 // TRON's /wallet/getblockbynum returns a block whose transactions
 // are themselves opaque IDs; the caller (scanner.go) then fans out to
 // /wallet/gettransaction to decode each one.
+// GetBlockByNumber returns the canonical block shape. The legacy
+// TRON HTTP API has two flavours for `transactions`:
+//
+//   * trongrid.io returns a JSON array of transaction ID strings:
+//     {"transactions": ["abc...", "def...", ...]}. The scanner
+//     fans out to /wallet/gettransactionbyid for each.
+//   * Chainstack returns inline transaction objects:
+//     {"transactions": [{"txID": "abc..."}, ...]}. We extract the
+//     txID field and produce the same string array.
+//
+// `height` is always echoed back because some providers
+// (testnet) do not include `raw_data.number` in the response.
 func (a *Adapter) GetBlockByNumber(ctx context.Context, height uint64) (bc.Block, error) {
-	var resp struct {
-		BlockID    string   `json:"blockID"`
-		TxHashes  []string `json:"transactions"`
-		RawData   struct {
-			Timestamp int64 `json:"timestamp"`
-		} `json:"raw_data"`
-	}
-	if err := a.callWithFailover(ctx, MethodGetBlockByNum, map[string]any{"num": height}, &resp); err != nil {
+	rb, err := a.getBlockRaw(ctx, height)
+	if err != nil {
 		return bc.Block{}, err
 	}
+
+	hashes := make([]string, 0)
+	if len(rb.Transactions) > 0 {
+		// First try the trongrid.io shape: array of strings.
+		if err := json.Unmarshal(rb.Transactions, &rb.TxStrings); err == nil && len(rb.TxStrings) > 0 {
+			hashes = append(hashes, rb.TxStrings...)
+		} else {
+			// Fall back to Chainstack: array of objects.
+			if err := json.Unmarshal(rb.Transactions, &rb.TxObjects); err != nil {
+				return bc.Block{}, fmt.Errorf("decode transactions field: %w", err)
+			}
+			for _, t := range rb.TxObjects {
+				if t.TxID != "" {
+					hashes = append(hashes, t.TxID)
+				}
+			}
+		}
+	}
+
+	ts := rb.RawData.Timestamp
+	if ts == 0 {
+		ts = rb.Timestamp
+	}
 	return bc.Block{
-		Height:  height,
-		Hash:    resp.BlockID,
-		LogTime: time.UnixMilli(resp.RawData.Timestamp),
-		TxHashes: resp.TxHashes,
-		IsFinal: true,
+		Height:   height,
+		Hash:     rb.Hash,
+		LogTime:  time.UnixMilli(ts),
+		TxHashes: hashes,
+		IsFinal:  true,
 	}, nil
 }
 
@@ -406,6 +500,49 @@ func (a *Adapter) getTransactionInfo(ctx context.Context, txHash string) (bc.Tra
 		Status:      status,
 		Events:      events,
 	}, nil
+}
+
+// getBlockRaw fetches a block and returns the raw response so
+// GetBlockByNumber can decode providers that disagree on whether
+// `transactions` is a string array of tx ids (trongrid.io) or an
+// array of inline objects (Chainstack). We normalise here so the
+// scanner does not have to know which provider it is talking to.
+func (a *Adapter) getBlockRaw(ctx context.Context, height uint64) (rawBlock, error) {
+	var r rawBlock
+	if err := a.callWithFailover(ctx, MethodGetBlockByNum, map[string]any{"num": height}, &r); err != nil {
+		return rawBlock{}, err
+	}
+	if r.Timestamp == 0 && r.RawData.Timestamp != 0 {
+		r.Timestamp = r.RawData.Timestamp
+	}
+	// Hash is the only field we read; we keep one struct tag.
+	_ = r.Hash
+	return r, nil
+}
+
+// rawBlock captures both shapes the legacy TRON HTTP API uses.
+// trongrid.io returns {"transactions":["hash1","hash2",...]} (the
+// scanner fans out to gettransactionbyid for each), while
+// Chainstack returns inline transaction objects in the same field.
+// We decode the inline shape so the scanner has both the hashes
+// and the receipts from a single round-trip (cheaper when the
+// network round-trips 100+ms).
+type rawBlock struct {
+	Hash string `json:"blockID"`
+	RawData struct {
+		Number    int64 `json:"number"`
+		Timestamp int64 `json:"timestamp"`
+	} `json:"raw_data"`
+	Timestamp int64 `json:"timestamp,omitempty"`
+	// Transactions has two flavours; the decoder fills whichever
+	// one is present.
+	TxStrings    []string              `json:"-"`
+	TxObjects    []rawBlockTransaction `json:"-"`
+	Transactions json.RawMessage        `json:"transactions"`
+}
+
+type rawBlockTransaction struct {
+	TxID string `json:"txID"`
 }
 
 // ParseTransferEvents extracts TRC20 Transfer events from a

@@ -1,0 +1,365 @@
+// tron-scanner daemon: polls the TRON adapter for new blocks,
+// walks every USDT-TRC20 Transfer event, and persists credits to
+// the deposits table via the ledger module.
+//
+// Background:
+//   B5 of the wallet V1 plan (BOSS 2026-09-01). The scanner is
+//   intentionally a separate process from cmd/api and cmd/wallet-api
+//   so a runaway scan (RPC stuck, panic, OOM) cannot take user-facing
+//   endpoints down. V1 runs a single scanner instance; V2 will run
+//   one per chain with cursor persistence per chain.
+//
+// Configuration is via environment variables so docker compose can
+// wire it from .env without touching code:
+//
+//   TRON_PRIMARY_URL          e.g. https://...chainstack.com/{token}
+//   TRON_PRIMARY_KEY          TRON-PRO-API-KEY header (optional)
+//   TRON_BACKUP_URL           failover endpoint (or same as primary)
+//   TRON_BACKUP_KEY           TRON-PRO-API-KEY for the failover
+//   TRON_POLL_SEC             polling interval (default 10)
+//   TRON_ASSET                contract to track (default USDT-TRC20)
+//   SCANNER_BATCH_BLOCKS      blocks per tick (default 10)
+//
+// scanner is read-only on the wallet side: it never holds
+// private keys, never broadcasts, and never signs transactions. The
+// signer daemon is a separate concern (B3).
+//
+// V1 watches the full USDT-TRC20 contract; events that match a
+// user deposit address (looked up from `wallet_addresses`) are
+// persisted as deposit rows. Events that hit an address not in
+// our table are silently dropped — we are not a free indexer.
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/goexdev/goexchange/internal/blockchain"
+	tronadapter "github.com/goexdev/goexchange/internal/blockchain/tron"
+	"github.com/goexdev/goexchange/internal/config"
+	"github.com/goexdev/goexchange/internal/db"
+	"github.com/goexdev/goexchange/internal/vaultinit"
+)
+
+func main() {
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log.Info("starting goexchange-tron-scanner")
+
+	cfg, err := config.Load("config.yaml")
+	if err != nil {
+		log.Error("load config", "error", err)
+		os.Exit(1)
+	}
+
+	vaultClient, err := vaultinit.Init(cfg, context.Background(), log)
+	if err != nil {
+		log.Error("init vault", "error", err)
+		os.Exit(1)
+	}
+	_ = vaultClient
+
+	pool, err := db.Connect(context.Background(), cfg.Database.URL)
+	if err != nil {
+		log.Error("connect db", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	adapter, err := buildAdapter(log)
+	if err != nil {
+		log.Error("build tron adapter", "error", err)
+		os.Exit(1)
+	}
+
+	registry := blockchain.NewRegistry()
+	registry.Register(adapter)
+	for _, c := range blockchain.RegisterStubs(registry) {
+		_ = c
+	}
+
+	pollSec := envInt("TRON_POLL_SEC", 10)
+	asset := os.Getenv("TRON_ASSET")
+	if asset == "" {
+		asset = "USDT"
+	}
+	contract := contractForAsset(asset)
+	if contract == "" {
+		log.Error("asset has no known contract", "asset", asset)
+		os.Exit(1)
+	}
+
+	scanner := tronadapter.NewScanner(adapter, log)
+	scanner.AddWatchByContract(contract)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cursor lives in scanner_state so a restart picks up where
+	// the previous run left off. Migrations create the table; we
+	// just read/write.
+	if cur, err := loadCursor(ctx, pool, "TRON"); err != nil {
+		log.Warn("cursor load failed (starting from head - 27)", "error", err)
+	} else {
+		scanner.SetCursor(cur)
+		log.Info("scanner cursor loaded", "cursor", cur)
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Info("tron-scanner shutting down")
+		cancel()
+	}()
+
+	tick := time.NewTicker(time.Duration(pollSec) * time.Second)
+	defer tick.Stop()
+
+	log.Info("tron-scanner running",
+		"poll_sec", pollSec,
+		"asset", asset,
+		"contract", contract,
+	)
+	// Run an immediate scan so the first events are not delayed
+	// by the first tick.
+	if err := runOnce(ctx, scanner, pool, registry, adapter, contract, log); err != nil {
+		log.Warn("initial scan", "error", err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if err := runOnce(ctx, scanner, pool, registry, adapter, contract, log); err != nil {
+				log.Warn("scan tick", "error", err)
+			}
+		}
+	}
+}
+
+// runOnce performs one polling cycle. Wrapped so the goroutine in
+// main can call it without 6 positional arguments.
+func runOnce(
+	ctx context.Context,
+	scanner *tronadapter.Scanner,
+	pool *pgxpool.Pool,
+	registry *blockchain.Registry,
+	adapter blockchain.Adapter,
+	contract string,
+	log *slog.Logger,
+) error {
+	events := 0
+	delivered := make(chan tronadapter.Event, 64)
+	errCh := make(chan error, 1)
+
+	go func() {
+		n, err := scanner.RunOnce(ctx, func(e tronadapter.Event) {
+			delivered <- e
+		})
+		events = n
+		errCh <- err
+	}()
+
+	// Drain until the scanner returns or we time out. A single
+	// tick should complete in under 30s on a healthy chain; we
+	// keep a hard 60s cap so a wedged RPC cannot pin the loop.
+	timer := time.NewTimer(60 * time.Second)
+	defer timer.Stop()
+
+	persisted := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return errors.New("scan tick timed out after 60s")
+		case err := <-errCh:
+			if err != nil {
+				return err
+			}
+			// Drain any remaining events the scanner pushed before
+			// returning.
+			for {
+				select {
+				case e := <-delivered:
+					if err := persistEvent(ctx, pool, registry, adapter, contract, e, log); err != nil {
+						log.Warn("persist event failed",
+							"hash", e.TxHash, "index", e.EventIdx, "error", err)
+						continue
+					}
+					persisted++
+				default:
+					if err := saveCursor(ctx, pool, "TRON", scanner.GetCursor()); err != nil {
+						log.Warn("cursor save failed", "error", err)
+					}
+					log.Info("scan tick ok", "events", events, "persisted", persisted)
+					return nil
+				}
+			}
+		case e := <-delivered:
+			if err := persistEvent(ctx, pool, registry, adapter, contract, e, log); err != nil {
+				log.Warn("persist event failed",
+					"hash", e.TxHash, "index", e.EventIdx, "error", err)
+				continue
+			}
+			persisted++
+		}
+	}
+}
+
+// persistEvent writes one Transfer event as a deposit row. The
+// (chain, tx_hash, event_index) unique constraint on `deposits`
+// (migration 0029) makes this idempotent — a re-scan of the same
+// block will not create a duplicate row.
+//
+// We rely on the scanner's watched-set (set to the USDT contract)
+// for the `to` filter; this method assumes the event has already
+// been pre-filtered. The match against user deposit addresses is
+// done by a SQL JOIN on wallet_addresses.
+func persistEvent(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	_ *blockchain.Registry,
+	_ blockchain.Adapter,
+	contract string,
+	e tronadapter.Event,
+	log *slog.Logger,
+) error {
+	// 1. Find a user whose deposit address matches the event's `to`.
+	//    If none match, the deposit is for an external address and
+	//    is silently ignored — we are not a free indexer.
+	var (
+		userID    uuid.UUID
+		addressID uuid.UUID
+		asset     string
+	)
+	err := pool.QueryRow(ctx, `
+		SELECT id, user_id, asset
+		FROM wallet_addresses
+		WHERE address = $1 AND status = 'ACTIVE'
+		LIMIT 1`, e.To).Scan(&addressID, &userID, &asset)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Not our user; not an error.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lookup wallet_addresses: %w", err)
+	}
+
+	// 2. Insert into deposits with the idempotency key
+	//    (chain, tx_hash, event_index). ON CONFLICT DO NOTHING so
+	//    a re-poll of the same block is a no-op.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO deposits (
+			id, user_id, asset, chain, amount, tx_hash,
+			from_address, to_address, confirmations, status
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, 'PENDING')
+		ON CONFLICT (chain, tx_hash, event_index) DO NOTHING`,
+		uuid.New(), userID, asset, e.Chain, e.Amount, e.TxHash,
+		e.From, e.To)
+	if err != nil {
+		return fmt.Errorf("insert deposit: %w", err)
+	}
+
+	log.Info("deposit detected",
+		"user_id", userID,
+		"asset", asset,
+		"amount", e.Amount,
+		"tx_hash", e.TxHash,
+	)
+	return nil
+}
+
+// loadCursor and saveCursor persist the scanner's height so a
+// restart picks up where the previous run stopped. The single-row
+// table lives at scanner_state(chain, last_scanned_block).
+func loadCursor(ctx context.Context, pool *pgxpool.Pool, chain string) (uint64, error) {
+	var h uint64
+	err := pool.QueryRow(ctx,
+		`SELECT last_scanned_block FROM scanner_state WHERE chain = $1`, chain).Scan(&h)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	return h, err
+}
+
+func saveCursor(ctx context.Context, pool *pgxpool.Pool, chain string, height uint64) error {
+	_, err := pool.Exec(ctx, `
+		INSERT INTO scanner_state (chain, last_scanned_block, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (chain) DO UPDATE
+		SET last_scanned_block = EXCLUDED.last_scanned_block,
+		    updated_at = EXCLUDED.updated_at`, chain, height)
+	return err
+}
+
+// contractForAsset returns the canonical hex (with 0x41 prefix for
+// TRON) contract address for the given ticker. V1 only knows USDT.
+func contractForAsset(asset string) string {
+	switch strings.ToUpper(asset) {
+	case "USDT":
+		// USDT-TRC20 mainnet. Source: TRONSCAN.
+		return "41a614f803b6fd780986a42c79ec8394ade726993d"
+	}
+	return ""
+}
+
+func buildAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
+	primaryURL := os.Getenv("TRON_PRIMARY_URL")
+	backupURL := os.Getenv("TRON_BACKUP_URL")
+	if primaryURL == "" {
+		return nil, errors.New("TRON_PRIMARY_URL not set")
+	}
+	if backupURL == "" {
+		backupURL = primaryURL
+	}
+	return tronadapter.NewAdapter(tronadapter.Config{
+		Primary: tronadapter.Provider{
+			Name:    "primary",
+			BaseURL: primaryURL,
+			APIKey:  os.Getenv("TRON_PRIMARY_KEY"),
+		},
+		Backup: tronadapter.Provider{
+			Name:    "backup",
+			BaseURL: backupURL,
+			APIKey:  os.Getenv("TRON_BACKUP_KEY"),
+		},
+		Logger: log,
+		Network: tronadapter.NetworkMainnet,
+	})
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// Ensure the json import survives in case the file is later edited
+// to drop the persist helpers above. The dependency is harmless.
+var _ = json.Marshal
+
+// Avoid unused http import if HTTP-based RPC ever leaves the file.
+var _ = http.MethodGet

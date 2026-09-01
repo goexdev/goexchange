@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,11 @@ type Scanner struct {
 	// Empty by default; populated by AddWatch / RemoveWatch. The
 	// scanner only emits Transfer events whose "to" is in the set.
 	watched map[string]struct{}
+	// watchedContracts holds hex-form contract addresses; events
+	// whose contract is in this set are emitted regardless of the
+	// per-address watched set. Initialised lazily by
+	// AddWatchByContract.
+	watchedContracts map[string]struct{}
 
 	// pollInterval is the minimum time between two polls when the
 	// head does not advance. We do not want to hammer RPC when the
@@ -76,6 +82,29 @@ func NewScanner(a bc.Adapter, log *slog.Logger) *Scanner {
 func (s *Scanner) AddWatch(addr string) {
 	s.mu.Lock()
 	s.watched[addr] = struct{}{}
+	s.mu.Unlock()
+}
+
+// AddWatchByContract activates "watch every event for this
+// contract" mode. The scanner emits every Transfer event whose
+// contract matches the given hex value; the caller is responsible
+// for joining against a per-user deposit-address table to decide
+// which events to credit. AddWatchByContract is a different mode
+// from AddWatch — both can be active at the same time, with the
+// scanner emitting the union of the two filters.
+func (s *Scanner) AddWatchByContract(contract string) {
+	s.mu.Lock()
+	if s.watchedContracts == nil {
+		s.watchedContracts = map[string]struct{}{}
+	}
+	s.watchedContracts[strings.ToLower(contract)] = struct{}{}
+	s.mu.Unlock()
+}
+
+// RemoveWatchByContract undoes AddWatchByContract.
+func (s *Scanner) RemoveWatchByContract(contract string) {
+	s.mu.Lock()
+	delete(s.watchedContracts, strings.ToLower(contract))
 	s.mu.Unlock()
 }
 
@@ -131,8 +160,12 @@ type Event struct {
 //
 // RunOnce is exported so tests can drive the scanner deterministically
 // without time.Sleep.
+//
+// The scanner hard-codes a "lag by N blocks" finality window
+// internally (see headBehindBy) so callers do not need to pass it.
+// Callers only supply the deliver callback.
 func (s *Scanner) RunOnce(ctx context.Context, deliver func(Event)) (int, error) {
-	if len(s.watched) == 0 {
+	if len(s.watched) == 0 && len(s.watchedContracts) == 0 {
 		// Nothing to do. Skip the RPC round-trips entirely; this is
 		// the common case right after a fresh deploy before any
 		// user has requested a deposit address.
@@ -195,7 +228,12 @@ func (s *Scanner) RunOnce(ctx context.Context, deliver func(Event)) (int, error)
 }
 
 // processTx fetches one transaction, parses its Transfer events, and
-// invokes deliver for every event whose "to" is in the watched set.
+// invokes deliver for every event that matches either the
+// watched-address set (AddWatch) or the watched-contract set
+// (AddWatchByContract). The two modes are independent — a small
+// deploy can use just AddWatch for a known set of deposit
+// addresses; a wider deploy can use AddWatchByContract to surface
+// every event and filter at the SQL layer.
 func (s *Scanner) processTx(ctx context.Context, txHash string, blockNum uint64, ts time.Time, deliver func(Event)) error {
 	tx, err := s.adapter.GetTransaction(ctx, txHash)
 	if err != nil {
@@ -207,14 +245,13 @@ func (s *Scanner) processTx(ctx context.Context, txHash string, blockNum uint64,
 		return nil
 	}
 	// We pass an empty contract string so ParseTransferEvents returns
-	// every Transfer; the watched-address check below filters down to
-	// what we actually care about.
+	// every Transfer; the filter below picks the right ones.
 	events, err := s.adapter.ParseTransferEvents(tx, "")
 	if err != nil {
 		return err
 	}
 	for _, e := range events {
-		if !s.isWatched(e.To) {
+		if !s.shouldEmit(e) {
 			continue
 		}
 		deliver(Event{
@@ -244,6 +281,19 @@ func (s *Scanner) isWatched(addr string) bool {
 	}
 	// Allow also the 0x-prefixed form.
 	_, hit = s.watched[normaliseAddr(addr)]
+	return hit
+}
+
+// shouldEmit returns true if the event matches either watched
+// mode (address set or contract set). Both can be active; the
+// scanner emits the union so a single tx can hit both filters.
+func (s *Scanner) shouldEmit(e bc.TransferEvent) bool {
+	if s.isWatched(e.To) {
+		return true
+	}
+	s.mu.Lock()
+	_, hit := s.watchedContracts[strings.ToLower(e.Contract)]
+	s.mu.Unlock()
 	return hit
 }
 
