@@ -27,8 +27,9 @@ func TestMultiProviderLive(t *testing.T) {
 	chainstack := os.Getenv("TRON_TEST_TOKEN_CHAINSTACK")
 	nownodes := os.Getenv("TRON_TEST_TOKEN_NOWNODES")
 	drpc := os.Getenv("TRON_TEST_TOKEN_DRPC")
-	if chainstack == "" && nownodes == "" && drpc == "" {
-		t.Skip("TRON_TEST_TOKEN_CHAINSTACK, TRON_TEST_TOKEN_NOWNODES, and TRON_TEST_TOKEN_DRPC all unset")
+	dwellir := os.Getenv("TRON_TEST_TOKEN_DWELLIR")
+	if chainstack == "" && nownodes == "" && drpc == "" && dwellir == "" {
+		t.Skip("TRON_TEST_TOKEN_{CHAINSTACK,NOWNODES,DRPC,DWELLIR} all unset")
 	}
 
 	// Build a list of providers that are actually configured. The
@@ -55,6 +56,14 @@ func TestMultiProviderLive(t *testing.T) {
 	//     generic 4xx and fails over to the next provider, which
 	//     means drpc.org naturally degrades to chainstack+nownodes
 	//     on a free-tier key.
+	//
+	//   - dwellir: token in path, /wallet/{method}. Same legacy
+	//     HTTP API shape; identical on the wire to chainstack.
+	//     dwellir also exposes /jsonrpc (rejects the
+	//     {"jsonrpc":"2.0","method":...} envelope with code:-32601)
+	//     and /walletsolidity, so V2 could add a
+	//     RPCStyleJSONRPC mode that routes via /jsonrpc for
+	//     dwellir specifically.
 	var providers []Provider
 	if chainstack != "" {
 		providers = append(providers, Provider{
@@ -74,6 +83,13 @@ func TestMultiProviderLive(t *testing.T) {
 		providers = append(providers, Provider{
 			Name:    "drpc",
 			BaseURL: "https://lb.drpc.live/tron/" + drpc,
+			Weight:  1,
+		})
+	}
+	if dwellir != "" {
+		providers = append(providers, Provider{
+			Name:    "dwellir",
+			BaseURL: "https://api-tron-mainnet.n.dwellir.com/" + dwellir,
 			Weight:  1,
 		})
 	}
