@@ -69,8 +69,8 @@ const (
 	// request bodies are empty and Chainstack rejects POST with a
 	// 405.
 	MethodGetBlockByNum       RPCMethod = "GET /wallet/getblockbynum"
-	MethodGetTransactionInfo  RPCMethod = "GET /wallet/gettransactioninfobyid"
-	MethodGetTransaction      RPCMethod = "GET /wallet/gettransactionbyid"
+	MethodGetTransactionInfo  RPCMethod = "POST /wallet/gettransactioninfobyid"
+	MethodGetTransaction      RPCMethod = "POST /wallet/gettransactionbyid"
 	MethodGetNowBlock         RPCMethod = "GET /wallet/getnowblock"
 	MethodGetBlock            RPCMethod = "GET /wallet/getblock"
 
@@ -720,6 +720,17 @@ func (a *Adapter) getTransactionInfo(ctx context.Context, txHash string) (bc.Tra
 		status = bc.TxStatusSuccess
 	case "FAILED", "REVERT", "OUT_OF_ENERGY":
 		status = bc.TxStatusFailed
+	case "":
+		// Some chainstack responses omit the `result` field
+		// entirely (just `{"net_usage": N}`) when the tx was
+		// accepted and a TRX transfer contract ran cleanly.
+		// Combined with blockNumber > 0 that means the node
+		// saw the tx and put it in a block. Treat as SUCCESS;
+		// an explicit FAILED result still wins because it
+		// carries an enum value.
+		if resp.BlockNumber > 0 {
+			status = bc.TxStatusSuccess
+		}
 	}
 
 	// Serialize the logs into the adapter's opaque Event list so
