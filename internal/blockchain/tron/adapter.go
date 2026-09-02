@@ -15,6 +15,7 @@ package tron
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +79,7 @@ const (
 	// (signed transaction, or trigger input).
 	MethodBroadcastTransaction   RPCMethod = "POST /wallet/broadcasttransaction"
 	MethodTriggerConstantContract RPCMethod = "POST /wallet/triggerconstantcontract"
+	MethodTriggerSmartContract    RPCMethod = "POST /wallet/triggersmartcontract"
 )
 
 // RPCStyle controls how callJSON wraps the request. The default
@@ -852,10 +854,163 @@ func (a *Adapter) GetBalance(ctx context.Context, addr string, contract string) 
 
 // BuildTransfer constructs an unsigned TriggerSmartContract that
 // transfers `amount` units of `contract` from the signer key
-// identified by `keyID` to `to`. The implementation here is a stub
-// because V1's withdrawal flow goes through the signer service (B3).
+// identified by `keyID` to `to`. We delegate to the chain node's
+// /wallet/triggersmartcontract endpoint which assembles the
+// full TriggerSmartContract protobuf (the entire Transaction.raw_data
+// submessage) for us and returns it as raw_data_hex. The signer
+// service SHA-256s that raw_data and appends its 65-byte signature;
+// the caller concatenates the signature back into the
+// Transaction.signature[0] field and POSTs the rebuilt Transaction
+// protobuf to Broadcast.
+//
+// V1 simplifies this: the signer returns raw_tx || sig; we leave
+// the broadcast to the wallet service which knows how to splice
+// the sig into the broadcast payload. See service_v1.go.
 func (a *Adapter) BuildTransfer(ctx context.Context, keyID string, to string, amount uint64, contract string) (bc.BuildResult, error) {
-	return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: TODO(B3) — assemble TriggerSmartContract for %s -> %s", keyID, to)
+	// Convert Base58 to hex (with 41 prefix for TRON addresses).
+	ownerHex, err := base58ToHexTron(keyID)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: decode owner %q: %w", keyID, err)
+	}
+	contractHex, err := base58ToHexTron(contract)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: decode contract %q: %w", contract, err)
+	}
+	toHex, err := base58ToHexTron(to)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: decode to %q: %w", to, err)
+	}
+
+	// Encode transfer(address,uint256) call data.
+	// selector = keccak256("transfer(address,uint256)")[:4] = 0xa9059cbb
+	// params = 32-byte left-padded to || 32-byte big-endian amount
+	data := encodeTransferCall(toHex, amount)
+
+	params := map[string]any{
+		"owner_address":     ownerHex,
+		"contract_address":  contractHex,
+		"function_selector": "transfer(address,uint256)",
+		"parameter":         data,
+		"call_value":        0,
+		"fee_limit":         100_000_000, // 100 TRX = 1e8 sun
+		"visible":           false,        // keep hex inputs/outputs (v1 default)
+	}
+
+	var resp struct {
+		TxID        string `json:"txID"`
+		RawDataHex  string `json:"raw_data_hex"`
+		RawData     string `json:"raw_data"`     // alternate key
+		Transaction *struct {
+			TxID       string `json:"txID"`
+			RawDataHex string `json:"raw_data_hex"`
+		} `json:"transaction"` // chainstack wraps the unsigned tx under "transaction"
+		Result      map[string]any `json:"result"` // chainstack wraps under "result" + per-call result
+		Visible     *bool  `json:"visible,omitempty"`
+	}
+	if err := a.callWithFailover(ctx, MethodTriggerSmartContract, params, &resp); err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: %w", err)
+	}
+	// Handle nested `result` envelope if present.
+	rawHex := resp.RawDataHex
+	if rawHex == "" {
+		rawHex = resp.RawData
+	}
+	if rawHex == "" && resp.Transaction != nil {
+		rawHex = resp.Transaction.RawDataHex
+	}
+	if rawHex == "" && resp.Result != nil {
+		if v, ok := resp.Result["raw_data_hex"].(string); ok {
+			rawHex = v
+		}
+		if v, ok := resp.Result["raw_data"].(string); ok && rawHex == "" {
+			rawHex = v
+		}
+		// Some providers nest the unsigned tx under result.transaction.
+		if tx, ok := resp.Result["transaction"].(map[string]any); ok {
+			if v, ok := tx["raw_data_hex"].(string); ok && rawHex == "" {
+				rawHex = v
+			}
+		}
+	}
+	if rawHex == "" {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: empty raw_data_hex in response: %+v", resp)
+	}
+	rawBytes, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: hex decode raw_data_hex: %w", err)
+	}
+	txID := resp.TxID
+	if txID == "" && resp.Transaction != nil {
+		txID = resp.Transaction.TxID
+	}
+	if txID == "" && resp.Result != nil {
+		if v, ok := resp.Result["txID"].(string); ok {
+			txID = v
+		}
+		if tx, ok := resp.Result["transaction"].(map[string]any); ok {
+			if v, ok := tx["txID"].(string); ok && txID == "" {
+				txID = v
+			}
+		}
+	}
+	return bc.BuildResult{
+		RawTx:  rawBytes,
+		TxHash: txID,
+		FeeCost: bc.ResourceCost{
+			Kind:   bc.ResourceEnergy,
+			Amount: big.NewInt(100_000_000),
+			Symbol: "SUN",
+		},
+	}, nil
+}
+
+// encodeTransferCall builds the calldata for transfer(address,uint256).
+// `to_hex_with_41_prefix` is the destination as 21-byte hex (41 + 20
+// bytes). The selector 0xa9059cbb is hard-coded.
+//
+// The returned string is raw hex (no 0x prefix). TRON's
+// triggersmartcontract endpoint hex-decodes this on the server
+// side, and including a 0x prefix yields the
+// "bouncycastle.encoders.DecoderException: invalid characters"
+// error observed against nile.trongrid.io and chainstack.
+func encodeTransferCall(toHex41Prefix string, amount uint64) string {
+	// Strip the 41 prefix, left-pad to 32 bytes (64 hex chars).
+	addr := strings.TrimPrefix(toHex41Prefix, "41")
+	if len(addr) != 40 {
+		addr = strings.Repeat("0", 40-len(addr)) + addr // pad if shorter
+	}
+	paramAddr := strings.Repeat("0", 64-len(addr)) + addr
+	// Amount as 32-byte big-endian.
+	paramAmount := fmt.Sprintf("%064x", amount)
+	// No 0x prefix — TRON nodes reject it with a bouncycastle
+	// hex-decoder error.
+	return "a9059cbb" + paramAddr + paramAmount
+}
+
+// base58ToHexTron decodes a Base58 address to hex with the 41
+// TRON mainnet prefix. TRON addresses are 25 bytes:
+// version_byte (1) + address (20) + checksum (4).
+// We validate the version byte and discard the checksum;
+// re-checksumming is the chain's job on broadcast.
+func base58ToHexTron(addr string) (string, error) {
+	if !strings.HasPrefix(addr, "T") && !strings.HasPrefix(addr, "41") {
+		return "", fmt.Errorf("address must start with T (base58) or 41 (hex)")
+	}
+	if strings.HasPrefix(addr, "41") {
+		return strings.ToLower(addr), nil
+	}
+	decoded, err := base58CheckDecode(addr)
+	if err != nil {
+		return "", err
+	}
+	// TRON address layout: 1 byte version + 20 bytes address + 4 bytes checksum.
+	if len(decoded) != 21 {
+		return "", fmt.Errorf("expected 21-byte payload (ver+addr), got %d bytes", len(decoded))
+	}
+	if decoded[0] != 0x41 {
+		return "", fmt.Errorf("expected TRON mainnet version byte 0x41, got 0x%02x", decoded[0])
+	}
+	return "41" + hex.EncodeToString(decoded[1:21]), nil
 }
 
 // Broadcast submits an already-signed transaction to the network.
@@ -896,6 +1051,42 @@ func (a *Adapter) Broadcast(ctx context.Context, signedTx []byte) (bc.BroadcastR
 		}
 	}
 	return bc.BroadcastResult{}, fmt.Errorf("tron: broadcast failed on all %d providers", len(a.providers))
+}
+
+// BroadcastWithSignature is the V1 path for withdrawing USDT:
+// the signer service returns raw_data bytes (the Transaction
+// .raw_data submessage that the chain node assembled for us
+// during BuildTransfer) followed by the 65-byte [R||S||V]
+// signature; the chain node accepts them as separate JSON
+// fields on /wallet/broadcasttransaction so we do not need to
+// re-serialise the full Transaction protobuf ourselves.
+//
+// Failure semantics match Broadcast: Accepted=false means the
+// chain explicitly rejected the tx (e.g. balance too low,
+// signature invalid); an empty TxHash with Accepted=true
+// means the chain did not answer but the bytes may still be
+// picked up — the worker treats this as BROADCAST_UNKNOWN.
+func (a *Adapter) BroadcastWithSignature(ctx context.Context, rawData []byte, sig []byte) (bc.BroadcastResult, error) {
+	if len(sig) != 65 {
+		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: expected 65-byte signature, got %d", len(sig))
+	}
+	params := map[string]any{
+		"raw_data_hex": hex.EncodeToString(rawData),
+		"signature_hex": hex.EncodeToString(sig),
+		"visible": false,
+	}
+	var resp struct {
+		Result  bool   `json:"result"`
+		TxID    string `json:"txid"`
+		Message string `json:"message"`
+	}
+	if err := a.callWithFailover(ctx, MethodBroadcastTransaction, params, &resp); err != nil {
+		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast: %w", err)
+	}
+	if !resp.Result {
+		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", resp.Message)
+	}
+	return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
 }
 
 // broadcastOnce POSTs the signed tx bytes to the broadcast
