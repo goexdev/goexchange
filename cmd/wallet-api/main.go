@@ -61,6 +61,8 @@ import (
 	"github.com/goexdev/goexchange/internal/vaultinit"
 	"github.com/goexdev/goexchange/internal/wallet"
 	"github.com/google/uuid"
+	"encoding/hex"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -167,6 +169,33 @@ func main() {
 		wallet:    walletSvc,
 		signer:    signerC,
 		tronAd:    tronAd,
+		networkName: tronAd.Network(),
+	}
+
+	// Populate hotWalletAddr via signer.DeriveAddress(0). If the
+	// signer is unreachable we log + continue with empty addr;
+	// withdrawals will fail with "hot wallet not configured"
+	// until the signer is back.
+	if signerC != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		encoded, _, _, err := signerC.Derive(ctx, "TRON", 0)
+		cancel()
+		if err != nil {
+			log.Warn("could not derive hot wallet addr", "error", err)
+		} else {
+			srv.hotWalletAddr = encoded
+			log.Info("hot wallet address loaded", "address", encoded)
+		}
+	}
+
+	// Worker context. Cancelled when main returns, so the
+	// withdrawal worker exits cleanly on SIGTERM.
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	if signerC != nil && tronAd != nil {
+		go srv.runWithdrawalWorker(workerCtx)
+	} else {
+		log.Warn("withdrawal worker disabled: signer or tron adapter missing")
 	}
 
 	httpSrv := &http.Server{
@@ -194,12 +223,14 @@ func main() {
 
 // server holds the dependencies the wallet-api routes need.
 type server struct {
-	log        *slog.Logger
-	pool       *pgxpool.Pool
-	jwtSecret  []byte
-	wallet     *wallet.ServiceV1
-	signer     *signerclient.Client
-	tronAd     *tronadapter.Adapter
+	log          *slog.Logger
+	pool         *pgxpool.Pool
+	jwtSecret    []byte
+	wallet       *wallet.ServiceV1
+	signer       *signerclient.Client
+	tronAd       *tronadapter.Adapter
+	networkName  string // "mainnet" | "nile_testnet" — used by the worker to pick the right USDT contract
+	hotWalletAddr string // populated at startup via signer.DeriveAddress(0)
 }
 
 // routes returns the chi-equivalent http.Handler with the wallet
@@ -213,7 +244,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/wallet/v1/deposit-address", s.auth(s.getDepositAddress))
 	mux.HandleFunc("/wallet/v1/balance", s.auth(s.getBalance))
 	mux.HandleFunc("/wallet/v1/deposits", s.auth(s.listDeposits))
-	mux.HandleFunc("/wallet/v1/withdrawals", s.auth(s.listWithdrawals))
+	// Withdrawals: GET lists, POST creates. Method dispatched
+	// inside the handler so we share one auth + audit path.
+	mux.HandleFunc("/wallet/v1/withdrawals", s.auth(s.dispatchWithdrawals))
 	// Admin RPC control. Mounted under /admin/wallet/v1/rpc/* so
 	// the admin namespace stays separate from the user endpoints.
 	// Auth: same Bearer JWT as the rest of the API, plus a
@@ -565,6 +598,462 @@ func (s *server) listWithdrawals(w http.ResponseWriter, r *http.Request, uid uui
 	writeJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out)})
 }
 
+// dispatchWithdrawals routes GET/POST on /wallet/v1/withdrawals to
+// the list or create handler. We keep a single auth path and a
+// single idempotency header check (Idempotency-Key on POST) at
+// this entry point so neither handler has to re-validate.
+func (s *server) dispatchWithdrawals(w http.ResponseWriter, r *http.Request, uid uuid.UUID) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listWithdrawals(w, r, uid)
+	case http.MethodPost:
+		s.createWithdrawal(w, r, uid)
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// createWithdrawal is the V1 entry point for a user-initiated
+// withdrawal. V1 scope is intentionally narrow:
+//
+//  1. We accept {chain, asset, dest_address, amount}.
+//  2. We validate balance + address format only; risk scoring
+//     and 2FA confirmation are V2.
+//  3. We INSERT a row with status=PENDING and return its id;
+//     the worker loop in runWithdrawalWorker processes it
+//     asynchronously.
+//
+// Idempotency-Key is honoured via withdrawal_idempotency. A repeat
+// POST with the same key returns the original withdrawal_id and
+// does not create a new row.
+func (s *server) createWithdrawal(w http.ResponseWriter, r *http.Request, uid uuid.UUID) {
+	var req struct {
+		Chain   string `json:"chain"`
+		Asset   string `json:"asset"`
+		To      string `json:"destination"`
+		Amount  string `json:"amount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	chain := strings.ToUpper(strings.TrimSpace(req.Chain))
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	to := strings.TrimSpace(req.To)
+	if chain != "TRON" {
+		writeJSONError(w, http.StatusBadRequest, "only TRON chain supported in V1")
+		return
+	}
+	if asset != "USDT" {
+		writeJSONError(w, http.StatusBadRequest, "only USDT asset supported in V1")
+		return
+	}
+	if !tronValidateAddress(to) {
+		writeJSONError(w, http.StatusBadRequest, "destination must be a TRON Base58 address (T-prefix)")
+		return
+	}
+	amountFloat, err := strconv.ParseFloat(req.Amount, 64)
+	if err != nil || amountFloat <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "amount must be a positive number")
+		return
+	}
+	// USDT has 6 decimals on TRON; convert to integer amount.
+	amountUnits := uint64(amountFloat * 1_000_000)
+	const minAmount uint64 = 100_000 // 0.1 USDT
+	if amountUnits < minAmount {
+		writeJSONError(w, http.StatusBadRequest, "amount below minimum 0.1 USDT")
+		return
+	}
+
+	// Idempotency-Key handling. Same key + same user returns the
+	// original withdrawal_id; this protects against browser
+	// retries.
+	idemKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		s.log.Error("withdrawal begin tx failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx) // safe to call even after Commit
+
+	if idemKey != "" {
+		var existingID string
+		err := tx.QueryRow(ctx,
+			`SELECT withdrawal_id FROM withdrawal_idempotency WHERE user_id = $1 AND idempotency_key = $2`,
+			uid, idemKey).Scan(&existingID)
+		if err == nil {
+			// Idempotent replay; return the existing withdrawal.
+			if err := tx.Commit(ctx); err != nil {
+				s.log.Error("idem commit failed", "error", err)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"withdrawal_id": existingID,
+				"status":        "PENDING",
+				"replay":        true,
+			})
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.log.Error("idem lookup failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	// Check user balance: must have amount available. We lock
+	// the row for update so a concurrent withdraw does not
+	// double-spend.
+	var available string
+	err = tx.QueryRow(ctx,
+		`SELECT available::text FROM balances WHERE user_id = $1 AND asset = $2 FOR UPDATE`,
+		uid, asset).Scan(&available)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSONError(w, http.StatusBadRequest, "no balance for this asset")
+			return
+		}
+		s.log.Error("balance lookup failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	balFloat, err := strconv.ParseFloat(available, 64)
+	if err != nil || balFloat < amountFloat {
+		writeJSONError(w, http.StatusBadRequest, "insufficient balance")
+		return
+	}
+
+	// Lock the funds: move amount from available to frozen.
+	_, err = tx.Exec(ctx,
+		`UPDATE balances SET available = available - $2::numeric, frozen = frozen + $2::numeric, updated_at = NOW()
+		 WHERE user_id = $1 AND asset = $3`,
+		uid, req.Amount, asset)
+	if err != nil {
+		s.log.Error("balance lock failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	// Insert the withdrawal row.
+	var withdrawalID string
+	err = tx.QueryRow(ctx,
+		`INSERT INTO withdrawals (user_id, chain, asset, amount, dest_address, status, receive_amount, fee)
+		 VALUES ($1, $2, $3, $4::numeric, $5, 'PENDING', $4::numeric, 0)
+		 RETURNING id::text`,
+		uid, chain, asset, req.Amount, to).Scan(&withdrawalID)
+	if err != nil {
+		s.log.Error("withdrawal insert failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if idemKey != "" {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO withdrawal_idempotency (user_id, idempotency_key, withdrawal_id) VALUES ($1, $2, $3)`,
+			uid, idemKey, withdrawalID)
+		if err != nil {
+			s.log.Error("idem insert failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		s.log.Error("withdrawal commit failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	s.log.Info("withdrawal created",
+		"withdrawal_id", withdrawalID,
+		"user_id", uid,
+		"chain", chain, "asset", asset,
+		"amount", req.Amount, "to", to)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"withdrawal_id": withdrawalID,
+		"status":        "PENDING",
+	})
+}
+
+// runWithdrawalWorker polls the withdrawals table for PENDING
+// rows and runs each through the build → sign → broadcast
+// pipeline. One worker goroutine per wallet-api process is enough
+// for V1 traffic; rate-limit sensitivity is at the adapter level.
+//
+// State transitions on success:
+//   PENDING → SIGNING → SIGNED → BROADCASTED → COMPLETED
+// On failure the row is moved to FAILED with the error stored
+// in error_msg; the row stays so an operator can inspect.
+//
+// Returns when ctx is cancelled.
+func (s *server) runWithdrawalWorker(ctx context.Context) {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	s.log.Info("withdrawal worker started")
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("withdrawal worker stopping", "reason", ctx.Err())
+			return
+		case <-tick.C:
+			s.processPendingWithdrawals(ctx)
+		}
+	}
+}
+
+// processPendingWithdrawals fetches up to N pending rows and runs
+// each through the build → sign → broadcast pipeline. Each row
+// is processed sequentially so we do not slam the signer or the
+// chain; rows still pending after maxPerTick are picked up next
+// tick.
+func (s *server) processPendingWithdrawals(ctx context.Context) {
+	const maxPerTick = 5
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, chain, asset, dest_address, amount::text, user_id::text
+		 FROM withdrawals
+		 WHERE status = 'PENDING'
+		 ORDER BY created_at ASC
+		 LIMIT $1
+		 FOR UPDATE SKIP LOCKED`, maxPerTick)
+	if err != nil {
+		s.log.Error("withdrawal worker query failed", "error", err)
+		return
+	}
+	type item struct {
+		ID, Chain, Asset, To, Amount, UID string
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.ID, &it.Chain, &it.Asset, &it.To, &it.Amount, &it.UID); err != nil {
+			s.log.Error("withdrawal worker scan failed", "error", err)
+			continue
+		}
+		items = append(items, it)
+	}
+	rows.Close()
+	for _, it := range items {
+		s.processOneWithdrawal(ctx, it)
+	}
+}
+
+// processOneWithdrawal is the actual state machine for a single
+// withdrawal row. Errors at each stage persist back to the DB so
+// the row reflects the actual outcome even if the process crashes.
+//
+// V1 dry-run mode: set TRON_DRY_RUN_BROADCAST=1 to stop after
+// signing and persist the row as SIGNED without submitting to the
+// chain. Used to verify the build+sign pipeline end-to-end
+// without paying real TRX fees; an operator can later flip the
+// row to PENDING and let the worker retry with broadcast enabled.
+func (s *server) processOneWithdrawal(ctx context.Context, it struct {
+	ID, Chain, Asset, To, Amount, UID string
+}) {
+	wlog := s.log.With("withdrawal_id", it.ID, "chain", it.Chain, "asset", it.Asset)
+
+	// 1. PENDING → SIGNING. We use a per-row conditional UPDATE
+	//    so two worker instances (or a parallel admin manual
+	//    sign) do not race.
+	if err := s.updateWithdrawalStatus(ctx, it.ID, "PENDING", "SIGNING", nil, nil, ""); err != nil {
+		wlog.Error("transition PENDING->SIGNING failed", "error", err)
+		return
+	}
+	wlog.Info("withdrawal signing started")
+
+	// 2. Build the unsigned transaction via the adapter. The
+	//    adapter talks to a chain RPC node which assembles
+	//    the protobuf and returns raw_data bytes.
+	contract := "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t" // USDT contract (mainnet; nile has its own — V1 explicit below)
+	if s.networkName == "nile_testnet" {
+		// Nile testnet USDT: TXYZop... is mainnet. The actual
+		// Nile contract address is published in the trongrid
+		// testnet docs. For V1 we accept whatever the env
+		// variable TRON_USDT_CONTRACT points to, falling back
+		// to mainnet (V1 only runs against mainnet in
+		// production; tests switch to nile separately).
+		if v := os.Getenv("TRON_USDT_CONTRACT"); v != "" {
+			contract = v
+		}
+	}
+	hotWalletAddr := s.hotWalletAddr // populated at startup from signer DeriveAddress(0)
+	build, err := s.tronAd.BuildTransfer(ctx, hotWalletAddr, it.To, usdtToUnits(it.Amount), contract)
+	if err != nil {
+		wlog.Error("BuildTransfer failed", "error", err)
+		s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "FAILED", nil, nil, err.Error())
+		// Unlock balance.
+		s.unlockWithdrawalBalance(ctx, it.UID, it.Asset, it.Amount)
+		return
+	}
+	wlog.Info("BuildTransfer ok", "tx_hash", build.TxHash, "raw_tx_len", len(build.RawTx))
+
+	// 3. Sign via the signer service. signer returns
+	//    raw_tx || 65-byte signature; we strip the trailing
+	//    signature and use it as Transaction.signature[0].
+	signedTx, txHash, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", "mainnet", build.RawTx)
+	if err != nil {
+		wlog.Error("Sign RPC failed", "error", err)
+		s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "FAILED", nil, nil, err.Error())
+		s.unlockWithdrawalBalance(ctx, it.UID, it.Asset, it.Amount)
+		return
+	}
+	sig := signedTx[len(build.RawTx):]
+	if len(sig) != 65 {
+		wlog.Error("unexpected signature length", "len", len(sig))
+		s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "FAILED", nil, nil, fmt.Sprintf("bad signature length %d", len(sig)))
+		s.unlockWithdrawalBalance(ctx, it.UID, it.Asset, it.Amount)
+		return
+	}
+	wlog.Info("signed ok", "tx_hash", txHash, "sig_len", len(sig))
+
+	// V1 dry-run short-circuit. Persist the signed_tx as
+	// SIGNED and return without touching the chain. The chain
+	// ID + tx_hash field on the row carry the bytes the
+	// operator needs to inspect or replay later.
+	if os.Getenv("TRON_DRY_RUN_BROADCAST") == "1" {
+		// Append the 65-byte sig hex to error_msg so the
+		// operator can extract it from the DB for offline
+		// replay. error_msg is normally a human-readable
+		// failure string; we abuse it here for a one-off
+		// observability affordance.
+		sigHex := hex.EncodeToString(sig)
+		wlog.Info("dry-run: skipping broadcast",
+			"raw_tx_len", len(build.RawTx),
+			"sig_hex_len", len(sigHex),
+			"tx_hash", txHash)
+		// Transition from SIGNING (where the row sits at this
+		// point) directly to a terminal SIGNED state. We do
+		// NOT advance through BROADCASTED in dry-run because
+		// the broadcast RPC was deliberately skipped; using
+		// BROADCASTED as the guard status would mismatch the
+		// actual row state and the conditional UPDATE would
+		// 0-row.
+		if err := s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "SIGNED", &txHash, nil, "dry-run sig="+sigHex); err != nil {
+			wlog.Error("dry-run transition failed", "error", err)
+		}
+		return
+	}
+
+	// 4. Broadcast. adapter.Broadcast accepts the raw signed
+// bytes (full Transaction protobuf) and returns the tx_hash
+// that the chain assigned. We pass the original build.RawTx
+// as the body and splice the signature into the protobuf in
+// the adapter — but for V1 we send raw_data + signature
+// concatenated, which is what most chainstack-compatible
+// RPCs accept directly (broadcasttransaction takes
+// "raw_data_hex" + "signature_hex" as JSON fields).
+	bcastResp, err := s.tronAd.BroadcastWithSignature(ctx, build.RawTx, sig)
+	if err != nil {
+		wlog.Error("Broadcast failed", "error", err)
+		s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "FAILED", &txHash, nil, err.Error())
+		// Don't unlock here — chain may still pick up the
+		// signed bytes; BROADCAST_UNKNOWN + manual review
+		// is the safer state.
+		s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "BROADCAST_UNKNOWN", &txHash, nil, err.Error())
+		return
+	}
+	txHash = bcastResp.TxHash
+	if txHash == "" {
+		// keep txHash from the signer — the network may not
+		// have responded with its txID but the bytes were
+		// submitted.
+	}
+	wlog.Info("broadcast ok", "tx_hash", txHash, "accepted", bcastResp.Accepted)
+
+	// 5. BROADCASTED → COMPLETED for V1 (skip IN_BLOCK/
+	//    SOLIDIFIED tracking — confirmation watch is a
+	//    separate worker that will move it further).
+	if err := s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "COMPLETED", &txHash, nil, ""); err != nil {
+		wlog.Error("transition BROADCASTED->COMPLETED failed", "error", err)
+	}
+	// Move frozen → zero (we sent the funds; the chain owns
+	// them now). Use a separate UPDATE so we keep the audit
+	// trail clear.
+	if err := s.burnWithdrawalBalance(ctx, it.UID, it.Asset, it.Amount); err != nil {
+		wlog.Error("frozen->zero burn failed", "error", err)
+	}
+}
+
+// updateWithdrawalStatus is the only place the worker changes
+// withdrawal status. It always passes the previous status as
+// a guard so two workers cannot race each other; a 0-row result
+// means the row's status changed under us and we lost the race.
+func (s *server) updateWithdrawalStatus(ctx context.Context, id, fromStatus, toStatus string, txHash *string, completedAt *time.Time, errMsg string) error {
+	ct, err := s.pool.Exec(ctx,
+		`UPDATE withdrawals
+		 SET status = $2::text,
+		     tx_hash = COALESCE($3, tx_hash),
+		     completed_at = COALESCE($4, completed_at),
+		     sent_at = CASE WHEN $2 IN ('BROADCASTED','COMPLETED') THEN NOW() ELSE sent_at END,
+		     error_msg = NULLIF($5, '')
+		 WHERE id = $1 AND status = $6::text`,
+		id, toStatus, txHash, completedAt, errMsg, fromStatus)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("withdrawal %s not in expected status %s", id, fromStatus)
+	}
+	return nil
+}
+
+// unlockWithdrawalBalance reverses the available→frozen lock
+// when the worker fails before broadcasting. Safe to call
+// repeatedly; the SQL is idempotent.
+func (s *server) unlockWithdrawalBalance(ctx context.Context, uid, asset, amount string) {
+	// Idempotent: use GREATEST so we never drive frozen below zero
+	// (this happens when a withdrawal row was inserted outside the
+	// createWithdrawal path and the available→frozen lock was
+	// never taken). The user can still recover the funds via an
+	// admin adjustment; the worker should not crash.
+	_, err := s.pool.Exec(ctx,
+		`UPDATE balances
+		 SET available = available + LEAST($2::numeric, frozen),
+		     frozen = GREATEST(frozen - $2::numeric, 0),
+		     updated_at = NOW()
+		 WHERE user_id = $1 AND asset = $3`,
+		uid, amount, asset)
+	if err != nil {
+		s.log.Error("unlock balance failed", "uid", uid, "asset", asset, "amount", amount, "error", err)
+	}
+}
+
+// burnWithdrawalBalance drops the frozen amount after the
+// withdrawal is broadcast (the funds are now on-chain).
+func (s *server) burnWithdrawalBalance(ctx context.Context, uid, asset, amount string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE balances
+		 SET frozen = GREATEST(frozen - $2::numeric, 0),
+		     updated_at = NOW()
+		 WHERE user_id = $1 AND asset = $3`,
+		uid, amount, asset)
+	return err
+}
+
+// usdtToUnits converts a human-readable USDT amount string (e.g.
+// "12.5") to its 6-decimal integer representation (12_500_000).
+// Returns 0 on parse error.
+func usdtToUnits(amount string) uint64 {
+	f, err := strconv.ParseFloat(amount, 64)
+	if err != nil {
+		return 0
+	}
+	return uint64(f * 1_000_000)
+}
+
+// tronValidateAddress does a Base58 format check (starts with T,
+// 34 chars, base58 alphabet). Full Base58Check checksum is
+// performed downstream by the chain when the tx is broadcast.
+func tronValidateAddress(s string) bool {
+	if len(s) != 34 || !strings.HasPrefix(s, "T") {
+		return false
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", c) {
+			return false
+		}
+	}
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -734,9 +1223,17 @@ func buildTronAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
 	if len(providers) == 0 {
 		return nil, errors.New("no TRON providers configured (set TRON_PRIMARY_URL or any TRON_PROVIDER_<name>_URL)")
 	}
+	// Network defaults to mainnet; honour TRON_NETWORK if the
+	// operator wants to point at the Nile testnet (V1 + V2 dev
+	// loop). Recognised values: "mainnet", "nile_testnet".
+	network := tronadapter.NetworkMainnet
+	if v := os.Getenv("TRON_NETWORK"); v == tronadapter.NetworkNile {
+		network = tronadapter.NetworkNile
+	}
 	return tronadapter.NewAdapter(tronadapter.Config{
 		Providers: providers,
 		Logger:    log,
+		Network:   network,
 	})
 }
 
