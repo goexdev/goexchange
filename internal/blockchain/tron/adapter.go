@@ -855,12 +855,98 @@ func (a *Adapter) ParseTransferEvents(tx bc.Transaction, contract string) ([]bc.
 // Balance + withdrawals (skeletons)
 // ---------------------------------------------------------------------------
 
-// GetBalance returns the on-chain balance of addr for the given
-// contract. V1 does not call this directly (the scanner derives
-// deposit amounts from Transfer events) so the implementation is a
-// TODO(B3): call /wallet/triggerconstantcontract with balanceOf(addr).
+// GetBalance returns the on-chain TRC20 balance of `addr` for the
+// given contract (e.g. USDT's contract address). It uses
+// /wallet/triggerconstantcontract with the balanceOf(address)
+// selector; the response includes a `constant_result` array
+// whose first element is the 32-byte big-endian balance.
+//
+// Empty contract returns the native TRX balance via
+// /wallet/getaccount. V1 only ships the TRC20 path because
+// everything on goexchange is USDT-TRC20 today; the native
+// path is left for whoever first needs it.
 func (a *Adapter) GetBalance(ctx context.Context, addr string, contract string) (bc.Balance, error) {
-	return bc.Balance{}, fmt.Errorf("tron.GetBalance: TODO(B3) — call triggerconstantcontract balanceOf(%s)", addr)
+	if contract == "" {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: native TRX balance not yet implemented")
+	}
+	ownerHex, err := base58ToHexTron(addr)
+	if err != nil {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: decode addr: %w", err)
+	}
+	contractHex, err := base58ToHexTron(contract)
+	if err != nil {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: decode contract: %w", err)
+	}
+	// balanceOf(address) takes a single 32-byte left-padded
+	// address parameter. selector 0x70a08231 = keccak256("balanceOf(address)")[:4].
+	paramAddr := strings.Repeat("0", 64-len(ownerHex)) + ownerHex
+	params := map[string]any{
+		"owner_address":     ownerHex,
+		"contract_address":  contractHex,
+		"function_selector": "balanceOf(address)",
+		"parameter":         paramAddr,
+		"visible":           false,
+	}
+	var resp struct {
+		// chainstack returns constant_result at the top level
+		// alongside transaction + result; trongrid nests it
+		// under result.constant_result. Decode both shapes.
+		ConstantResult []string          `json:"constant_result"`
+		Result         map[string]any    `json:"result"` // wraps {constant_result: [hex32bytes]}
+		EnergyUsed     int64             `json:"energy_used"`
+	}
+	if err := a.callWithFailover(ctx, MethodTriggerConstantContract, params, &resp); err != nil {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: %w", err)
+	}
+	rawHex := firstString(resp.ConstantResult)
+	if rawHex == "" {
+		rawHex = extractConstantResult(resp.Result)
+	}
+	if rawHex == "" {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: empty constant_result in response: %+v", resp)
+	}
+	balBytes, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return bc.Balance{}, fmt.Errorf("tron.GetBalance: hex decode balance: %w", err)
+	}
+	bal := new(big.Int).SetBytes(balBytes)
+	return bc.Balance{
+		Address:   addr,
+		Contract:  contract,
+		Available: bal,
+		Locked:    big.NewInt(0),
+		Decimals:  6, // USDT on TRON = 6; V1 hardcodes; future versions
+		              // should look this up via contract.decimals().
+	}, nil
+}
+
+// firstString returns the first non-empty element of a string
+// slice; "" when the slice is empty. Convenience helper for
+// the constant_result[] array that providers disagree on
+// whether to populate.
+func firstString(s []string) string {
+	for _, v := range s {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// extractConstantResult pulls the first constant_result hex string
+// out of a chainstack/trongrid response shape. The shape is
+// either {constant_result: ["hex"]} or {result: {constant_result:
+// ["hex"]}} or even an inline array.
+func extractConstantResult(m map[string]any) string {
+	if v, ok := m["constant_result"].([]any); ok && len(v) > 0 {
+		if s, ok := v[0].(string); ok {
+			return s
+		}
+	}
+	if inner, ok := m["result"].(map[string]any); ok {
+		return extractConstantResult(inner)
+	}
+	return ""
 }
 
 // BuildTransfer constructs an unsigned TriggerSmartContract that
