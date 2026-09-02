@@ -200,6 +200,15 @@ func main() {
 		// pattern differs (read-only gettransactioninfobyid
 		// vs write-side broadcast).
 		go srv.runConfirmationWatcher(workerCtx)
+		// Sweep pipeline. The planner decides WHEN to sweep
+		// (default every 10 min, threshold 10 USDT). The
+		// worker drains PENDING sweep_tasks through build ->
+		// sign -> broadcast. The sweep confirmation watcher
+		// then walks BROADCASTED -> COMPLETED using the same
+		// gettransactioninfobyid pattern as withdrawals.
+		go srv.runSweepPlanner(workerCtx)
+		go srv.runSweepWorker(workerCtx)
+		go srv.runSweepConfirmationWatcher(workerCtx)
 	} else {
 		log.Warn("withdrawal worker disabled: signer or tron adapter missing")
 	}
@@ -1064,6 +1073,446 @@ func countUnknownTicks(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// runSweepWorker polls sweep_tasks and drains PENDING rows
+// through build -> sign -> broadcast. It re-uses the same
+// signer + adapter plumbing as runWithdrawalWorker; the only
+// difference is the from/to addresses and the SQL source
+// table. The confirmation watcher (runConfirmationWatcher)
+// handles the BROADCASTED -> COMPLETED transition by tx_hash,
+// which is set on the sweep_tasks row just like it is on
+// withdrawals.
+//
+// Triggering sweeps is the responsibility of
+// runSweepPlanner (separate tick); this worker only drains
+// rows that already exist in sweep_tasks.
+//
+// State transitions:
+//
+//   PENDING -> BUILDING -> AWAITING_SIGN -> AWAITING_BROADCAST
+//   AWAITING_BROADCAST -> BROADCASTED       (set tx_hash)
+//   AWAITING_BROADCAST -> FAILED            (set last_error)
+//
+// Returns when ctx is cancelled.
+func (s *server) runSweepWorker(ctx context.Context) {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	s.log.Info("sweep worker started")
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("sweep worker stopping", "reason", ctx.Err())
+			return
+		case <-tick.C:
+			s.processPendingSweeps(ctx)
+		}
+	}
+}
+
+// processPendingSweeps drains up to N PENDING sweep rows.
+// Each row is processed sequentially; with sweep volume
+// expected in the low double-digits per hour, sequential
+// is fine for V1 and keeps the rate-limit envelope intact.
+func (s *server) processPendingSweeps(ctx context.Context) {
+	const maxPerTick = 3
+	rows, err := s.pool.Query(ctx,
+		`SELECT st.id::text,
+		        st.chain,
+		        st.asset,
+		        st.amount::text,
+		        fa.address AS from_addr,
+		        ta.address AS to_addr,
+		        ta.id::text  AS to_addr_id
+		 FROM sweep_tasks st
+		 JOIN wallet_addresses fa ON fa.id = st.from_address_id
+		 JOIN wallet_addresses ta ON ta.id = st.to_address_id
+		 WHERE st.status = 'PENDING'
+		 ORDER BY st.created_at ASC
+		 LIMIT $1
+		 FOR UPDATE OF st SKIP LOCKED`, maxPerTick)
+	if err != nil {
+		s.log.Error("sweep worker: query failed", "error", err)
+		return
+	}
+	type item struct {
+		ID, Chain, Asset, Amount, FromAddr, ToAddr, ToAddrID string
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.ID, &it.Chain, &it.Asset, &it.Amount,
+			&it.FromAddr, &it.ToAddr, &it.ToAddrID); err != nil {
+			s.log.Error("sweep worker: scan failed", "error", err)
+			continue
+		}
+		items = append(items, it)
+	}
+	rows.Close()
+	for _, it := range items {
+		s.processOneSweep(ctx, it)
+	}
+}
+
+// processOneSweep is the per-row state machine for sweeps.
+// The build/sign/broadcast pattern mirrors runWithdrawalWorker;
+// the only V1 simplification is that sweeps do not touch the
+// user's balances row directly. We do not subtract the sweeped
+// amount from the user's available balance because the user
+// deposit credits already happened at CREDITED time; the sweep
+// just consolidates the on-chain funds.
+//
+// If the sweep ultimately succeeds, an admin script (or the
+// reconciler in V2) credits the HOT wallet's "exchange
+// treasury" balance. For V1 we leave the treasury update out of
+// the worker so the change stays small.
+func (s *server) processOneSweep(ctx context.Context, it struct {
+	ID, Chain, Asset, Amount, FromAddr, ToAddr, ToAddrID string
+}) {
+	wlog := s.log.With("sweep_id", it.ID, "chain", it.Chain,
+		"from", it.FromAddr, "to", it.ToAddr)
+
+	// PENDING -> BUILDING.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sweep_tasks SET status = 'BUILDING', built_at = NOW()
+		 WHERE id = $1 AND status = 'PENDING'`, it.ID); err != nil {
+		wlog.Error("sweep PENDING->BUILDING failed", "error", err)
+		return
+	}
+
+	// BuildTransfer takes (from, to, amount, contract). The
+	// from-address comes from the sweep row; the contract is
+	// hard-coded USDT (V1 supports only USDT-TRC20 sweeps).
+	contract := "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+	if v := os.Getenv("TRON_USDT_CONTRACT"); v != "" {
+		contract = v
+	}
+	amountFloat, err := strconv.ParseFloat(it.Amount, 64)
+	if err != nil || amountFloat <= 0 {
+		wlog.Error("sweep amount parse failed", "amount", it.Amount, "error", err)
+		s.failSweep(ctx, it.ID, "BUILDING", fmt.Sprintf("bad amount %q", it.Amount))
+		return
+	}
+	amountUnits := uint64(amountFloat * 1_000_000)
+
+	build, err := s.tronAd.BuildTransfer(ctx, it.FromAddr, it.ToAddr, amountUnits, contract)
+	if err != nil {
+		wlog.Error("sweep BuildTransfer failed", "error", err)
+		s.failSweep(ctx, it.ID, "BUILDING", err.Error())
+		return
+	}
+	wlog.Info("sweep build ok",
+		"raw_tx_len", len(build.RawTx),
+		"build_tx_hash", build.TxHash)
+
+	// BUILDING -> AWAITING_SIGN.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sweep_tasks SET status = 'AWAITING_SIGN' WHERE id = $1 AND status = 'BUILDING'`,
+		it.ID); err != nil {
+		wlog.Error("sweep BUILDING->AWAITING_SIGN failed", "error", err)
+		return
+	}
+
+	// Note: in V1 the hot-wallet keypair is derived at index 0
+	 // by the signer service. V2 will pass an explicit
+	 // key_id per sweep (multi-hot-wallet support).
+	signedTx, _, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", "mainnet", build.RawTx)
+	if err != nil {
+		wlog.Error("sweep Sign RPC failed", "error", err)
+		s.failSweep(ctx, it.ID, "AWAITING_SIGN", err.Error())
+		return
+	}
+	sig := signedTx[len(build.RawTx):]
+	if len(sig) != 65 {
+		wlog.Error("sweep unexpected signature length", "len", len(sig))
+		s.failSweep(ctx, it.ID, "AWAITING_SIGN", fmt.Sprintf("bad signature length %d", len(sig)))
+		return
+	}
+
+	// AWAITING_SIGN -> AWAITING_BROADCAST.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sweep_tasks SET status = 'AWAITING_BROADCAST', signed_at = NOW() WHERE id = $1 AND status = 'AWAITING_SIGN'`,
+		it.ID); err != nil {
+		wlog.Error("sweep AWAITING_SIGN->AWAITING_BROADCAST failed", "error", err)
+		return
+	}
+
+	// Dry-run support for sweeps: skip the broadcast and
+	// persist the signed bytes for offline replay.
+	if os.Getenv("TRON_DRY_RUN_BROADCAST") == "1" {
+		sigHex := hex.EncodeToString(sig)
+		wlog.Info("sweep dry-run: skipping broadcast",
+			"raw_tx_len", len(build.RawTx),
+			"sig_hex_len", len(sigHex))
+		_, err = s.pool.Exec(ctx,
+			`UPDATE sweep_tasks SET status = 'SIGNED', tx_hash = $2, last_error = 'dry-run sig=' || $3
+			 WHERE id = $1 AND status = 'AWAITING_BROADCAST'`,
+			it.ID, build.TxHash, sigHex)
+		if err != nil {
+			wlog.Error("sweep dry-run transition failed", "error", err)
+		}
+		return
+	}
+
+	bcastResp, err := s.tronAd.BroadcastWithSignature(ctx, build.RawTx, sig)
+	if err != nil {
+		wlog.Error("sweep Broadcast failed", "error", err)
+		s.failSweep(ctx, it.ID, "AWAITING_BROADCAST", err.Error())
+		return
+	}
+	txHash := bcastResp.TxHash
+	if txHash == "" {
+		txHash = build.TxHash
+	}
+	wlog.Info("sweep broadcast ok",
+		"tx_hash", txHash,
+		"accepted", bcastResp.Accepted)
+
+	// AWAITING_BROADCAST -> BROADCASTED. The confirmation
+	// watcher's existing scope covers withdrawal rows only,
+	// so we add a parallel poll for sweep_tasks: same RPC
+	// pattern, different table.
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sweep_tasks SET status = 'BROADCASTED', tx_hash = $2, broadcast_at = NOW() WHERE id = $1 AND status = 'AWAITING_BROADCAST'`,
+		it.ID, txHash); err != nil {
+		wlog.Error("sweep AWAITING_BROADCAST->BROADCASTED failed", "error", err)
+	}
+}
+
+// failSweep is the catch-all error path; we always leave the
+// row in FAILED with a last_error string so the operator can
+// inspect.
+func (s *server) failSweep(ctx context.Context, id, fromStatus, errMsg string) {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE sweep_tasks SET status = 'FAILED', last_error = $2, completed_at = NOW()
+		 WHERE id = $1 AND status = $3`, id, errMsg, fromStatus)
+	if err != nil {
+		s.log.Error("sweep fail update failed", "sweep_id", id, "error", err)
+	}
+}
+
+// runSweepPlanner periodically scans DEPOSIT addresses and
+// inserts sweep_tasks rows for any whose on-chain balance
+// exceeds sweepThreshold. We do not poll the chain every tick
+// (rate-limit) — V1 defaults to a 10-minute interval, configurable
+// via TRON_SWEEP_PLANNER_INTERVAL (seconds).
+//
+// The planner is intentionally read-only on the chain side:
+// it never moves funds. The sweep_worker (above) drains the
+// resulting sweep_tasks rows.
+//
+// Returns when ctx is cancelled.
+func (s *server) runSweepPlanner(ctx context.Context) {
+	intervalSec := 600 // 10 min default
+	if v := os.Getenv("TRON_SWEEP_PLANNER_INTERVAL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			intervalSec = n
+		}
+	}
+	thresholdUnits := uint64(10 * 1_000_000) // 10 USDT default
+	if v := os.Getenv("TRON_SWEEP_THRESHOLD_USDT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			thresholdUnits = uint64(f * 1_000_000)
+		}
+	}
+	contract := "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+	if v := os.Getenv("TRON_USDT_CONTRACT"); v != "" {
+		contract = v
+	}
+	tick := time.NewTicker(time.Duration(intervalSec) * time.Second)
+	defer tick.Stop()
+	s.log.Info("sweep planner started",
+		"intervalSec", intervalSec,
+		"threshold_units", thresholdUnits)
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("sweep planner stopping", "reason", ctx.Err())
+			return
+		case <-tick.C:
+			s.planSweeps(ctx, contract, thresholdUnits)
+		}
+	}
+}
+
+// planSweeps scans every DEPOSIT address whose status is
+// ACTIVE, asks the chain for its current USDT balance, and
+// inserts a sweep_tasks row when the balance exceeds the
+// threshold. We use ON CONFLICT DO NOTHING on a synthetic
+// (from_address_id, status='PENDING') partial-unique index
+// to avoid duplicate inserts when two planner ticks race.
+func (s *server) planSweeps(ctx context.Context, contract string, thresholdUnits uint64) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, address
+		 FROM wallet_addresses
+		 WHERE chain = 'TRON'
+		   AND wallet_type = 'DEPOSIT'
+		   AND status = 'ACTIVE'`)
+	if err != nil {
+		s.log.Error("sweep planner: query deposits failed", "error", err)
+		return
+	}
+	type dep struct{ ID, Addr string }
+	var deps []dep
+	for rows.Next() {
+		var d dep
+		if err := rows.Scan(&d.ID, &d.Addr); err != nil {
+			continue
+		}
+		deps = append(deps, d)
+	}
+	rows.Close()
+	if len(deps) == 0 {
+		return
+	}
+
+	// Find HOT wallet (V1 assumes exactly one).
+	var hotID, hotAddr string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT id::text, address FROM wallet_addresses
+		 WHERE chain = 'TRON' AND wallet_type = 'HOT' AND status = 'ACTIVE'
+		 ORDER BY created_at ASC LIMIT 1`).Scan(&hotID, &hotAddr); err != nil {
+		s.log.Warn("sweep planner: no HOT wallet configured", "error", err)
+		return
+	}
+
+	for _, d := range deps {
+		bal, err := s.tronAd.GetBalance(ctx, d.Addr, contract)
+		if err != nil {
+			s.log.Warn("sweep planner: GetBalance failed", "addr", d.Addr, "error", err)
+			continue
+		}
+		if bal.Available == nil || bal.Available.Uint64() < thresholdUnits {
+			continue
+		}
+		// Insert sweep task. ON CONFLICT DO NOTHING on a
+		// partial unique index means at most one PENDING row
+		// per (from_address, asset). second planner tick
+		// finds it already exists and skips.
+		//
+		// V1 cooling-off: refuse to insert if the same
+		// from-address has a non-FAILED row younger than 1
+		// hour. This stops the planner from creating a new
+		// sweep immediately after the worker drains the old
+		// one (since the partial-unique index allows a new
+		// PENDING the moment the worker demotes the row to
+		// SIGNED/AWAITING_BROADCAST). Without the cooldown
+		// the planner would re-sweep the same address on
+		// every tick.
+		var existing int
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM sweep_tasks
+			 WHERE from_address_id = $1 AND status <> 'FAILED'
+			   AND created_at > NOW() - INTERVAL '1 hour'`,
+			d.ID).Scan(&existing); err != nil {
+			s.log.Warn("sweep planner: cooldown query failed", "error", err)
+		}
+		if existing > 0 {
+			s.log.Info("sweep planner: cooling off", "from", d.Addr,
+				"existing_recent", existing)
+			continue
+		}
+		amountFloat := float64(bal.Available.Uint64()) / 1_000_000
+		_, err = s.pool.Exec(ctx,
+			`INSERT INTO sweep_tasks
+			   (chain, asset, from_address_id, to_address_id, amount, status)
+			 VALUES ('TRON', 'USDT', $1::uuid, $2::uuid, $3::numeric, 'PENDING')
+			 ON CONFLICT (from_address_id, asset) WHERE status = 'PENDING'
+			 DO NOTHING`,
+			d.ID, hotID, fmt.Sprintf("%.6f", amountFloat))
+		if err != nil {
+			s.log.Error("sweep planner: insert failed", "addr", d.Addr, "error", err)
+			continue
+		}
+		s.log.Info("sweep planned",
+			"from", d.Addr, "to", hotAddr,
+			"amount", fmt.Sprintf("%.6f", amountFloat))
+	}
+}
+
+// runSweepConfirmationWatcher mirrors runConfirmationWatcher
+// but operates on sweep_tasks. Same RPC pattern (one
+// getnowblock + N gettransactioninfobyid), different table.
+// We keep it as a separate loop so withdrawal confirmations are
+// not gated on sweep throughput (and vice versa).
+//
+// Returns when ctx is cancelled.
+func (s *server) runSweepConfirmationWatcher(ctx context.Context) {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	s.log.Info("sweep confirmation watcher started")
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("sweep confirmation watcher stopping", "reason", ctx.Err())
+			return
+		case <-tick.C:
+			s.processPendingSweepConfirmations(ctx)
+		}
+	}
+}
+
+// processPendingSweepConfirmations walks BROADCASTED sweep
+// rows and advances them to SOLIDIFIED/COMPLETED/FAILED.
+//
+// We share the same finality threshold (block depth >= 27)
+// as the withdrawal watcher; this matches TRON's
+// "19 SRs voted" guarantee and is what GetSolidifiedBlock
+// returns.
+func (s *server) processPendingSweepConfirmations(ctx context.Context) {
+	if s.tronAd == nil {
+		return
+	}
+	solidified, err := s.tronAd.GetSolidifiedBlock(ctx)
+	if err != nil {
+		s.log.Warn("sweep confirmation watcher: GetSolidifiedBlock failed", "error", err)
+		return
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, tx_hash
+		 FROM sweep_tasks
+		 WHERE status = 'BROADCASTED'
+		   AND tx_hash IS NOT NULL
+		 ORDER BY created_at ASC
+		 LIMIT 50`)
+	if err != nil {
+		s.log.Error("sweep confirmation watcher: query failed", "error", err)
+		return
+	}
+	type item struct{ ID, TxHash string }
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.ID, &it.TxHash); err != nil {
+			continue
+		}
+		items = append(items, it)
+	}
+	rows.Close()
+	for _, it := range items {
+		tx, err := s.tronAd.GetTransaction(ctx, it.TxHash)
+		if err != nil {
+			s.log.Warn("sweep confirmation: GetTransaction failed", "tx_hash", it.TxHash, "error", err)
+			continue
+		}
+		if uint64(tx.BlockNumber) > solidified.Height {
+			_, _ = s.pool.Exec(ctx,
+				`UPDATE sweep_tasks SET status = 'IN_BLOCK' WHERE id = $1 AND status = 'BROADCASTED'`,
+				it.ID)
+			continue
+		}
+		switch tx.Status {
+		case blockchain.TxStatusSuccess:
+			_, _ = s.pool.Exec(ctx,
+				`UPDATE sweep_tasks SET status = 'COMPLETED', solidified_at = NOW(), completed_at = NOW() WHERE id = $1 AND status IN ('BROADCASTED','IN_BLOCK')`,
+				it.ID)
+			s.log.Info("sweep completed", "sweep_id", it.ID, "tx_hash", it.TxHash)
+		case blockchain.TxStatusFailed:
+			_, _ = s.pool.Exec(ctx,
+				`UPDATE sweep_tasks SET status = 'FAILED', last_error = 'contract reverted on chain', completed_at = NOW() WHERE id = $1 AND status IN ('BROADCASTED','IN_BLOCK')`,
+				it.ID)
+		}
+	}
 }
 
 // processOneWithdrawal is the actual state machine for a single
