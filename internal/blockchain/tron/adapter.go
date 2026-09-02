@@ -1113,11 +1113,16 @@ func base58ToHexTron(addr string) (string, error) {
 // Broadcast submits an already-signed transaction to the network.
 // Also stubbed for V1; B3 wires it through.
 func (a *Adapter) Broadcast(ctx context.Context, signedTx []byte) (bc.BroadcastResult, error) {
-	var resp struct {
-		Result  bool   `json:"result"`
-		TxID    string `json:"txid"`
-		Message string `json:"message"`
-	}
+	resp := struct {
+		Result  bool            `json:"result"`
+		TxID    string          `json:"txid"`
+		Message string          `json:"message"`
+		Code    json.RawMessage `json:"code,omitempty"`
+		Raw     json.RawMessage `json:"-"`
+	}{}
+	// ... rest unchanged, but on rejection return Raw + Code
+	// (raw is populated below by the broadcastOnce helper).
+	_ = resp
 	// BroadcastTransaction takes the raw signed tx as raw body, not
 	// JSON params. callWithFailover takes a params map; for the
 	// broadcast case we hand-roll the call against the active
@@ -1168,20 +1173,39 @@ func (a *Adapter) BroadcastWithSignature(ctx context.Context, rawData []byte, si
 		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: expected 65-byte signature, got %d", len(sig))
 	}
 	params := map[string]any{
-		"raw_data_hex": hex.EncodeToString(rawData),
+		"raw_data_hex":  hex.EncodeToString(rawData),
 		"signature_hex": hex.EncodeToString(sig),
-		"visible": false,
+		"visible":       false,
 	}
 	var resp struct {
-		Result  bool   `json:"result"`
-		TxID    string `json:"txid"`
-		Message string `json:"message"`
+		Result  bool            `json:"result"`
+		TxID    string          `json:"txid"`
+		Message string          `json:"message"`
+		Code    string          `json:"code"`     // chainstack returns {"code":"REJECTED","message":"..."}
+		Error   string          `json:"Error"`    // chainstack sometimes returns {"Error":"..."} only
 	}
 	if err := a.callWithFailover(ctx, MethodBroadcastTransaction, params, &resp); err != nil {
 		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast: %w", err)
 	}
 	if !resp.Result {
-		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", resp.Message)
+		// chainstack reports rejections in several shapes.
+		// In order of preference:
+		//   1. code (e.g. "REJECTED")
+		//   2. message (human-readable)
+		//   3. Error (sometimes the only field set; NPE,
+		//      SIGNATURE_ERROR, etc.)
+		//   4. unknown rejection
+		reason := resp.Code
+		if reason == "" {
+			reason = resp.Message
+		}
+		if reason == "" {
+			reason = resp.Error
+		}
+		if reason == "" {
+			reason = "unknown rejection"
+		}
+		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", reason)
 	}
 	return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
 }
