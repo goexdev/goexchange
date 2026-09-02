@@ -80,6 +80,7 @@ const (
 	MethodBroadcastTransaction   RPCMethod = "POST /wallet/broadcasttransaction"
 	MethodTriggerConstantContract RPCMethod = "POST /wallet/triggerconstantcontract"
 	MethodTriggerSmartContract    RPCMethod = "POST /wallet/triggersmartcontract"
+	MethodCreateTransaction      RPCMethod = "POST /wallet/createtransaction"
 )
 
 // RPCStyle controls how callJSON wraps the request. The default
@@ -963,7 +964,19 @@ func extractConstantResult(m map[string]any) string {
 // V1 simplifies this: the signer returns raw_tx || sig; we leave
 // the broadcast to the wallet service which knows how to splice
 // the sig into the broadcast payload. See service_v1.go.
+//
+// Native TRX path: when `contract` is empty the wallet service
+// is expected to call BuildNativeTransfer instead. V1's wallet
+// service does the dispatch based on whether the asset is a TRC20
+// or the native TRX.
+//
+// This stub remains because the adapter interface requires
+// BuildTransfer with the four-arg signature. The wallet
+// service routes around it.
 func (a *Adapter) BuildTransfer(ctx context.Context, keyID string, to string, amount uint64, contract string) (bc.BuildResult, error) {
+	if contract == "" {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: contract empty; use BuildNativeTransfer for TRX")
+	}
 	// Convert Base58 to hex (with 41 prefix for TRON addresses).
 	ownerHex, err := base58ToHexTron(keyID)
 	if err != nil {
@@ -1058,6 +1071,58 @@ func (a *Adapter) BuildTransfer(ctx context.Context, keyID string, to string, am
 			Amount: big.NewInt(100_000_000),
 			Symbol: "SUN",
 		},
+	}, nil
+}
+
+// BuildNativeTransfer constructs an unsigned TransferContract
+// (native TRX move) using the chain node's /wallet/createtransaction
+// endpoint. amount is in SUN (1 TRX = 1_000_000 SUN). The chain
+// returns raw_data_hex for the TransferContract; the signer
+// SHA-256s + signs and the worker broadcasts via
+// BroadcastWithSignature.
+//
+// Used for sweep-to-hot-wallet TRX top-ups (deposit address
+// sends TRX back to the hot wallet) and for any future
+// withdrawal that is the native asset rather than a TRC20.
+func (a *Adapter) BuildNativeTransfer(ctx context.Context, keyID string, to string, amountSun uint64) (bc.BuildResult, error) {
+	ownerHex, err := base58ToHexTron(keyID)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: decode owner: %w", err)
+	}
+	toHex, err := base58ToHexTron(to)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: decode to: %w", err)
+	}
+	params := map[string]any{
+		"owner_address": ownerHex,
+		"to_address":    toHex,
+		"amount":        amountSun,
+		"visible":       false,
+	}
+	var resp struct {
+		TxID       string `json:"txID"`
+		RawDataHex string `json:"raw_data_hex"`
+		Result     map[string]any `json:"result"`
+	}
+	if err := a.callWithFailover(ctx, MethodCreateTransaction, params, &resp); err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: %w", err)
+	}
+	rawHex := resp.RawDataHex
+	if rawHex == "" && resp.Result != nil {
+		if v, ok := resp.Result["raw_data_hex"].(string); ok {
+			rawHex = v
+		}
+	}
+	if rawHex == "" {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: empty raw_data_hex in response: %+v", resp)
+	}
+	rawBytes, err := hex.DecodeString(rawHex)
+	if err != nil {
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: hex decode: %w", err)
+	}
+	return bc.BuildResult{
+		RawTx: rawBytes,
+		TxHash: resp.TxID,
 	}, nil
 }
 
