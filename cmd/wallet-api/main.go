@@ -194,6 +194,12 @@ func main() {
 	defer workerCancel()
 	if signerC != nil && tronAd != nil {
 		go srv.runWithdrawalWorker(workerCtx)
+		// Confirmation watcher advances BROADCASTED/IN_BLOCK
+		// rows to COMPLETED via SOLIDIFIED. It uses the same
+		// tronAd and pool as the signing worker; only RPC
+		// pattern differs (read-only gettransactioninfobyid
+		// vs write-side broadcast).
+		go srv.runConfirmationWatcher(workerCtx)
 	} else {
 		log.Warn("withdrawal worker disabled: signer or tron adapter missing")
 	}
@@ -834,6 +840,230 @@ func (s *server) processPendingWithdrawals(ctx context.Context) {
 	for _, it := range items {
 		s.processOneWithdrawal(ctx, it)
 	}
+}
+
+// runConfirmationWatcher polls withdrawals that are BROADCASTED
+// or IN_BLOCK and walks them to COMPLETED via SOLIDIFIED.
+//
+// State transitions:
+//
+//   BROADCASTED -> IN_BLOCK         gettransactioninfobyid returns blockNumber
+//   IN_BLOCK    -> SOLIDIFIED       blockNumber <= solidified head (>=19 deep)
+//   SOLIDIFIED  -> COMPLETED        terminal; the broadcast-time burn has
+//                                    already moved frozen -> 0, so this row
+//                                    is purely a marker for the audit log
+//
+// Failure paths:
+//
+//   BROADCASTED -> BROADCAST_UNKNOWN   tx not findable after N ticks
+//   any         -> FAILED              receipt.result != SUCCESS (revert)
+//
+// Polling interval is 5 s; TRON blocks land every ~3 s and
+// finality takes ~60 s, so a 5 s tick keeps us inside the
+// rate-limit envelope (chainstack free tier = 5 RPS sustained,
+// 25 burst). One per-row tick is cheap: a single
+// gettransactioninfobyid + a single getnowblock shared by all
+// rows in the batch.
+//
+// Returns when ctx is cancelled.
+func (s *server) runConfirmationWatcher(ctx context.Context) {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	s.log.Info("confirmation watcher started")
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Info("confirmation watcher stopping", "reason", ctx.Err())
+			return
+		case <-tick.C:
+			s.processPendingConfirmations(ctx)
+		}
+	}
+}
+
+// processPendingConfirmations walks all BROADCASTED + IN_BLOCK
+// rows in one pass. We fetch the solidified head ONCE per tick
+// (chainstack caps RPS) and share it across rows; the per-row
+// call is only gettransactioninfobyid.
+//
+// Unknown-tx threshold: after `unknownThresholdTicks` ticks
+// (default 12 ≈ 60s) without seeing the tx, we mark the row
+// BROADCAST_UNKNOWN so an operator can investigate. We do NOT
+// fail outright because a slow-broadcast tx may simply be
+// delayed past the polling window of one node.
+const unknownThresholdTicks = 12
+
+func (s *server) processPendingConfirmations(ctx context.Context) {
+	if s.tronAd == nil {
+		return
+	}
+	// Solidified head. If the RPC fails we skip this tick
+	// rather than spam the chain.
+	solidified, err := s.tronAd.GetSolidifiedBlock(ctx)
+	if err != nil {
+		s.log.Warn("confirmation watcher: GetSolidifiedBlock failed", "error", err)
+		return
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text, tx_hash
+		 FROM withdrawals
+		 WHERE status IN ('BROADCASTED', 'IN_BLOCK')
+		   AND tx_hash IS NOT NULL
+		 ORDER BY created_at ASC
+		 LIMIT 50`)
+	if err != nil {
+		s.log.Error("confirmation watcher: query failed", "error", err)
+		return
+	}
+	type item struct {
+		ID, TxHash string
+	}
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.ID, &it.TxHash); err != nil {
+			s.log.Error("confirmation watcher: scan failed", "error", err)
+			continue
+		}
+		items = append(items, it)
+	}
+	rows.Close()
+	for _, it := range items {
+		s.confirmOneWithdrawal(ctx, it, solidified.Height)
+	}
+}
+
+// confirmOneWithdrawal is the per-row state machine. It reads
+// the tx receipt and decides whether to transition the row to
+// IN_BLOCK, COMPLETED, FAILED, or BROADCAST_UNKNOWN.
+//
+// `solidifiedHeight` is the head height at which a block becomes
+// final on TRON (~19 blocks behind the actual head). A tx whose
+// blockNumber <= solidifiedHeight is irreversible.
+func (s *server) confirmOneWithdrawal(ctx context.Context, it struct {
+	ID, TxHash string
+}, solidifiedHeight uint64) {
+	wlog := s.log.With("withdrawal_id", it.ID, "tx_hash", it.TxHash)
+	tx, err := s.tronAd.GetTransaction(ctx, it.TxHash)
+	if err != nil {
+		// RPC failure (timeout, rate limit) — leave row alone;
+		// next tick will retry.
+		wlog.Warn("confirmation watcher: GetTransaction failed", "error", err)
+		return
+	}
+	// TxStatusPending with no blockNumber means either still in
+	// mempool OR the RPC didn't return a receipt at all (i.e.
+	// unknown tx). Disambiguate by blockNumber.
+	if tx.BlockNumber == 0 && tx.Status == blockchain.TxStatusPending {
+		if err := s.bumpUnknownTick(ctx, it.ID); err != nil {
+			wlog.Error("bump unknown tick failed", "error", err)
+		}
+		return
+	}
+	// Tx is in a block.
+	if uint64(tx.BlockNumber) > solidifiedHeight {
+		// Included but not final yet.
+		_ = s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "IN_BLOCK", nil, nil, "")
+		// Persist block_number on the row so an operator can
+		// inspect or the next tick can detect "depth
+		// approaching solidification".
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE withdrawals SET block_number = $2::bigint
+			 WHERE id = $1 AND (block_number IS NULL OR block_number <> $2::bigint)`,
+			it.ID, tx.BlockNumber); err != nil {
+			wlog.Warn("block_number persist failed", "error", err)
+		}
+		wlog.Info("withdrawal in block",
+			"block_number", tx.BlockNumber,
+			"solidified_height", solidifiedHeight)
+		return
+	}
+	// Solidified: tx is final. Check receipt.result.
+	switch tx.Status {
+	case blockchain.TxStatusSuccess:
+		// Note: the frozen balance was already burned at
+		// BROADCASTED time (the broadcast is a commitment
+		// that funds will leave the ledger; solidified is
+		// just the receipt). We do not touch balances here.
+		// The conditional UPDATE matches from-status; if the
+		// row was BROADCASTED (this is the first time we
+		// observe it was already solidified) the first call
+		// 0-rows and the retry with BROADCASTED source
+		// succeeds.
+		if err := s.updateWithdrawalStatus(ctx, it.ID, "IN_BLOCK", "COMPLETED", nil, nil, ""); err != nil {
+			_ = s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "COMPLETED", nil, nil, "")
+		}
+		wlog.Info("withdrawal completed",
+			"block_number", tx.BlockNumber,
+			"solidified_height", solidifiedHeight,
+			"depth", solidifiedHeight-uint64(tx.BlockNumber))
+	case blockchain.TxStatusFailed:
+		if err := s.updateWithdrawalStatus(ctx, it.ID, "IN_BLOCK", "FAILED", nil, nil,
+			"contract reverted on chain; frozen balance burned, manual credit required"); err != nil {
+			_ = s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "FAILED", nil, nil,
+				"contract reverted on chain; frozen balance burned, manual credit required")
+		}
+		wlog.Warn("withdrawal reverted on chain", "block_number", tx.BlockNumber)
+	default:
+		wlog.Warn("unexpected tx status", "status", tx.Status)
+	}
+}
+
+// bumpUnknownTick increments an internal "unknown-tick count"
+// stored on the withdrawal row in error_msg. Once the count
+// exceeds the threshold, the row is demoted to BROADCAST_UNKNOWN.
+//
+// We piggyback on error_msg rather than adding a new column
+// because the count is observability-only; the operator either
+// retries the broadcast manually or moves on.
+func (s *server) bumpUnknownTick(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE withdrawals
+		 SET error_msg = COALESCE(error_msg, '') ||
+		     CASE WHEN error_msg LIKE '%unknown_ticks=%' THEN '' ELSE 'unknown_ticks=' END ||
+		     '1,'
+		 WHERE id = $1 AND status IN ('BROADCASTED','IN_BLOCK')`, id)
+	if err != nil {
+		return err
+	}
+	var errMsg string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(error_msg, '') FROM withdrawals WHERE id = $1`, id).Scan(&errMsg); err != nil {
+		return err
+	}
+	n := countUnknownTicks(errMsg)
+	if n < unknownThresholdTicks {
+		return nil
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE withdrawals
+		 SET status = 'BROADCAST_UNKNOWN'
+		 WHERE id = $1 AND status IN ('BROADCASTED','IN_BLOCK')`, id)
+	return err
+}
+
+// countUnknownTicks finds the LAST "unknown_ticks=N," substring
+// in error_msg and returns N. We append "1" on each tick and let
+// the operator eyeball the running list if they want history.
+func countUnknownTicks(s string) int {
+	const prefix = "unknown_ticks="
+	idx := strings.LastIndex(s, prefix)
+	if idx < 0 {
+		return 0
+	}
+	tail := s[idx+len(prefix):]
+	end := strings.IndexByte(tail, ',')
+	if end < 0 {
+		end = len(tail)
+	}
+	n := 0
+	for _, c := range tail[:end] {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 // processOneWithdrawal is the actual state machine for a single
