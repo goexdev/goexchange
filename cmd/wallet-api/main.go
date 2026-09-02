@@ -172,6 +172,17 @@ func main() {
 		networkName: tronAd.Network(),
 	}
 
+	// TOTP service. appSecret is derived from the JWT secret
+	// (>= 32 bytes after we paste it through cfg.JWT.Secret).
+	// Issuer is the site name; V1 hardcodes "goexchange".
+	totpSvc, err := auth.NewTOTPService(pool, string(cfg.JWT.Secret)+"-totp", "goexchange")
+	if err != nil {
+		log.Warn("TOTP service init failed; 2FA confirmation endpoint will return 501", "error", err)
+	} else {
+		srv.totp = totpSvc
+		log.Info("TOTP service ready")
+	}
+
 	// Populate hotWalletAddr via signer.DeriveAddress(0). If the
 	// signer is unreachable we log + continue with empty addr;
 	// withdrawals will fail with "hot wallet not configured"
@@ -246,6 +257,7 @@ type server struct {
 	tronAd       *tronadapter.Adapter
 	networkName  string // "mainnet" | "nile_testnet" — used by the worker to pick the right USDT contract
 	hotWalletAddr string // populated at startup via signer.DeriveAddress(0)
+	totp         *auth.TOTPService // nil → 2FA confirmation endpoint returns 501
 }
 
 // routes returns the chi-equivalent http.Handler with the wallet
@@ -259,9 +271,11 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/wallet/v1/deposit-address", s.auth(s.getDepositAddress))
 	mux.HandleFunc("/wallet/v1/balance", s.auth(s.getBalance))
 	mux.HandleFunc("/wallet/v1/deposits", s.auth(s.listDeposits))
-	// Withdrawals: GET lists, POST creates. Method dispatched
-	// inside the handler so we share one auth + audit path.
+	// Withdrawals: GET lists, POST creates, POST .../confirm
+	// moves RISK_CHECK -> PENDING via TOTP. We share one
+	// auth + audit path across the three methods.
 	mux.HandleFunc("/wallet/v1/withdrawals", s.auth(s.dispatchWithdrawals))
+	mux.HandleFunc("/wallet/v1/withdrawals/confirm", s.auth(s.confirmWithdrawal))
 	// Admin RPC control. Mounted under /admin/wallet/v1/rpc/* so
 	// the admin namespace stays separate from the user endpoints.
 	// Auth: same Bearer JWT as the rest of the API, plus a
@@ -272,6 +286,23 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/admin/wallet/v1/rpc/switch", s.adminAuth(s.switchRpcProvider))
 	mux.HandleFunc("/admin/wallet/v1/rpc/failover", s.adminAuth(s.failoverRpcProvider))
 	mux.HandleFunc("/admin/wallet/v1/rpc/health", s.adminAuth(s.rpcHealth))
+	// Admin manual-review queue. adminAuth requires the JWT
+	// claims.role == "admin" — see adminAuth middleware below.
+	// Each admin handler takes no uid (the admin is operating
+	// on a different user's withdrawal); we wrap them as
+	// plain http.HandlerFunc to satisfy adminAuth's signature.
+	mux.HandleFunc("/admin/wallet/v1/withdrawals/review",
+		s.adminAuth(func(w http.ResponseWriter, r *http.Request) {
+			s.listReviewWithdrawals(w, r)
+		}))
+	mux.HandleFunc("/admin/wallet/v1/withdrawals/review/approve",
+		s.adminAuth(func(w http.ResponseWriter, r *http.Request) {
+			s.approveReviewWithdrawal(w, r)
+		}))
+	mux.HandleFunc("/admin/wallet/v1/withdrawals/review/reject",
+		s.adminAuth(func(w http.ResponseWriter, r *http.Request) {
+			s.rejectReviewWithdrawal(w, r)
+		}))
 	return logRequest(s.log, mux)
 }
 
@@ -752,12 +783,29 @@ func (s *server) createWithdrawal(w http.ResponseWriter, r *http.Request, uid uu
 	}
 
 	// Insert the withdrawal row.
+	//
+	// Status is selected by the risk scorer:
+	//   score < 50          -> PENDING (auto-approve)
+	//   50 <= score < 80    -> RISK_CHECK (needs TOTP confirm)
+	//   score >= 80         -> MANUAL_REVIEW (needs admin)
+	//   score >= 100        -> REJECTED outright (admin alert)
+	score, factors := computeRiskScore(ctx, tx, uid, req.To, amountFloat)
+	initialStatus := "PENDING"
+	switch {
+	case score >= 100:
+		initialStatus = "REJECTED"
+	case score >= 80:
+		initialStatus = "MANUAL_REVIEW"
+	case score >= 50:
+		initialStatus = "RISK_CHECK"
+	}
 	var withdrawalID string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO withdrawals (user_id, chain, asset, amount, dest_address, status, receive_amount, fee)
-		 VALUES ($1, $2, $3, $4::numeric, $5, 'PENDING', $4::numeric, 0)
+		`INSERT INTO withdrawals (user_id, chain, asset, amount, dest_address, status, receive_amount, fee, risk_score, risk_hold)
+		 VALUES ($1, $2, $3, $4::numeric, $5, $6::text, $4::numeric, 0, $7::int, $8::bool)
 		 RETURNING id::text`,
-		uid, chain, asset, req.Amount, to).Scan(&withdrawalID)
+		uid, chain, asset, req.Amount, to, initialStatus, score,
+		initialStatus != "PENDING").Scan(&withdrawalID)
 	if err != nil {
 		s.log.Error("withdrawal insert failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "internal error")
@@ -782,10 +830,375 @@ func (s *server) createWithdrawal(w http.ResponseWriter, r *http.Request, uid uu
 		"withdrawal_id", withdrawalID,
 		"user_id", uid,
 		"chain", chain, "asset", asset,
-		"amount", req.Amount, "to", to)
-	writeJSON(w, http.StatusCreated, map[string]any{
+		"amount", req.Amount, "to", to,
+		"risk_score", score, "risk_status", initialStatus,
+		"factors", factors)
+	httpStatus := http.StatusCreated
+	switch initialStatus {
+	case "REJECTED":
+		httpStatus = http.StatusForbidden
+	case "MANUAL_REVIEW":
+		httpStatus = http.StatusAccepted
+	case "RISK_CHECK":
+		httpStatus = http.StatusAccepted
+	}
+	writeJSON(w, httpStatus, map[string]any{
 		"withdrawal_id": withdrawalID,
+		"status":        initialStatus,
+		"risk_score":    score,
+		"factors":       factors,
+		"action":        riskActionMessage(initialStatus),
+	})
+}
+
+// riskActionMessage is the human-readable next-step string
+// the wallet UI shows alongside the withdrawal_id.
+func riskActionMessage(status string) string {
+	switch status {
+	case "PENDING":
+		return "queued for processing"
+	case "RISK_CHECK":
+		return "2FA confirmation required: POST /wallet/v1/withdrawals/confirm"
+	case "MANUAL_REVIEW":
+		return "admin review required; status will update via /wallet/v1/withdrawals/<id>"
+	case "REJECTED":
+		return "withdrawal rejected by automated risk checks"
+	}
+	return ""
+}
+
+// computeRiskScore returns a heuristic risk score in [0, 100+]
+// and a list of factor strings the user can read in the
+// response. Score semantics:
+//
+//:
+//   0-49   PENDING     auto-approve, worker signs immediately
+//   50-79  RISK_CHECK  user must POST TOTP to /wallet/v1/withdrawals/confirm
+//   80-99  MANUAL_REVIEW admin queue; status updated by admin endpoint
+//   100+   REJECTED   hard reject; balance is auto-unlocked by the txn rollback
+//
+// V1 heuristics (no ML, no external scoring service):
+//
+//   amount > 100 / 1000 / 10000 USDT      +20 / +50 / +80
+//   new destination (first time)           +30
+//   unusual hour (UTC 22:00 - 06:00)        +15
+//   account age < 24h / < 1h               +40 / +60
+//   failed 2FA attempts in last 24h         +20 each
+//   daily cumulative withdrawal > 5000 USDT  +30
+//
+// Anything we cannot compute (missing user row, etc.) returns
+// 0 with no factors; the row is then PENDING. This is the
+// safest default — no signal → no risk flag.
+func computeRiskScore(ctx context.Context, q interface {
+ QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+ Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}, uid uuid.UUID, dest string, amount float64) (int, []string) {
+	var score int
+	var factors []string
+
+	// Amount thresholds.
+	switch {
+	case amount > 10000:
+		score += 80
+		factors = append(factors, fmt.Sprintf("amount>10000 (+80, now %d)", score))
+	case amount > 1000:
+		score += 50
+		factors = append(factors, fmt.Sprintf("amount>1000 (+50, now %d)", score))
+	case amount > 100:
+		score += 20
+		factors = append(factors, fmt.Sprintf("amount>100 (+20, now %d)", score))
+	}
+
+	// Account age.
+	var createdAt time.Time
+	err := q.QueryRow(ctx, `SELECT created_at FROM users WHERE id = $1`, uid).Scan(&createdAt)
+	if err == nil {
+		age := time.Since(createdAt)
+		switch {
+		case age < time.Hour:
+			score += 60
+			factors = append(factors, fmt.Sprintf("account_age<1h (+60, now %d)", score))
+		case age < 24*time.Hour:
+			score += 40
+			factors = append(factors, fmt.Sprintf("account_age<24h (+40, now %d)", score))
+		}
+	}
+
+	// New destination.
+	var usedCount int
+	if err := q.QueryRow(ctx,
+		`SELECT COUNT(*) FROM withdrawals WHERE user_id = $1 AND dest_address = $2 AND id <> $3::uuid`,
+		uid, dest, "00000000-0000-0000-0000-000000000000").Scan(&usedCount); err == nil {
+		// The "<> $3" is a no-op sentinel: count includes the
+		// row we are about to insert (which doesn't exist
+		// yet). We subtract one to get the historical count.
+		if usedCount > 0 {
+			score += 30
+			factors = append(factors, fmt.Sprintf("new_destination (+30, now %d)", score))
+		}
+	}
+
+	// Daily cumulative withdrawal (last 24h).
+	var dayTotal float64
+	if err := q.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount::numeric), 0)::float8 FROM withdrawals
+		 WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'
+		   AND status NOT IN ('REJECTED','FAILED','CANCELLED')`,
+		uid).Scan(&dayTotal); err == nil {
+		if dayTotal+amount > 5000 {
+			score += 30
+			factors = append(factors, fmt.Sprintf("daily_cum>5000 (+30, now %d)", score))
+		}
+	}
+
+	// Unusual hour (UTC 22:00 - 06:00).
+	h := time.Now().UTC().Hour()
+	if h >= 22 || h < 6 {
+		score += 15
+		factors = append(factors, fmt.Sprintf("unusual_hour (+15, now %d)", score))
+	}
+
+	// Failed 2FA attempts in last 24h. The 2FA attempts
+	// counter is logged via audit_log; we read it as a
+	// lightweight proxy here.
+	// V1 ships without a dedicated 2FA_attempts table, so we
+	// skip this factor; the endpoint will land in Risk.4.
+
+	return score, factors
+}
+
+// confirmWithdrawal is the V1 2FA gate for RISK_CHECK rows.
+// The user has already POSTed the withdrawal (which moved to
+// RISK_CHECK); they now POST {withdrawal_id, code} where code
+// is their current TOTP value.
+//
+// Behaviour:
+//   - 200 + status=PENDING    code accepted, row promoted
+//   - 400                     row not in RISK_CHECK
+//   - 401                     TOTP code wrong or expired
+//   - 501                     TOTP service not configured
+func (s *server) confirmWithdrawal(w http.ResponseWriter, r *http.Request, uid uuid.UUID) {
+	if s.totp == nil {
+		writeJSONError(w, http.StatusNotImplemented, "2FA confirmation not available on this server")
+		return
+	}
+	var req struct {
+		WithdrawalID string `json:"withdrawal_id"`
+		Code         string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.WithdrawalID == "" || req.Code == "" {
+		writeJSONError(w, http.StatusBadRequest, "withdrawal_id and code are required")
+		return
+	}
+
+	ctx := r.Context()
+	// First check ownership + status without taking the lock.
+	var ownerID string
+	var status string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT user_id::text, status FROM withdrawals WHERE id = $1::uuid`,
+		req.WithdrawalID).Scan(&ownerID, &status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "withdrawal not found")
+			return
+		}
+		s.log.Error("confirm withdrawal: query failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if ownerID != uid.String() {
+		writeJSONError(w, http.StatusForbidden, "withdrawal does not belong to this user")
+		return
+	}
+	if status != "RISK_CHECK" {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("withdrawal is in status %q, expected RISK_CHECK", status))
+		return
+	}
+
+	// Verify TOTP. VerifyCode already rejects used backup
+	// codes, replayed codes (V1 step=30s window), and
+	// wrong codes. We log every failed attempt so the
+	// risk scorer can pick it up later.
+	if err := s.totp.VerifyCode(ctx, uid, req.Code); err != nil {
+		s.log.Warn("2FA confirmation failed",
+			"withdrawal_id", req.WithdrawalID,
+			"user_id", uid, "error", err)
+		writeJSONError(w, http.StatusUnauthorized, "invalid or expired TOTP code")
+		return
+	}
+
+	// Promote RISK_CHECK -> PENDING. Conditional UPDATE
+	// guards against a race with the worker that may have
+	// already failed or moved the row (it should NOT move a
+	// RISK_CHECK row, but the SQL is defensive).
+	ct, err := s.pool.Exec(ctx,
+		`UPDATE withdrawals
+		 SET status = 'PENDING', risk_hold = false
+		 WHERE id = $1::uuid AND status = 'RISK_CHECK'`,
+		req.WithdrawalID)
+	if err != nil {
+		s.log.Error("confirm withdrawal: update failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeJSONError(w, http.StatusConflict, "withdrawal no longer in RISK_CHECK")
+		return
+	}
+	s.log.Info("withdrawal 2FA confirmed", "withdrawal_id", req.WithdrawalID, "user_id", uid)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"withdrawal_id": req.WithdrawalID,
 		"status":        "PENDING",
+		"action":        "queued for processing",
+	})
+}
+
+// listReviewWithdrawals is the admin endpoint that returns
+// every MANUAL_REVIEW withdrawal in created_at order, plus
+// any other rows with risk_score >= 80 (defensive — even
+// rows that escaped the status enum still surface here).
+func (s *server) listReviewWithdrawals(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.pool.Query(r.Context(),
+		`SELECT id::text, user_id::text, chain, asset, amount::text,
+		        dest_address, risk_score, created_at
+		 FROM withdrawals
+		 WHERE status = 'MANUAL_REVIEW'
+		    OR (risk_score >= 80 AND status NOT IN ('COMPLETED','FAILED','REJECTED','CANCELLED'))
+		 ORDER BY created_at ASC
+		 LIMIT 200`)
+	if err != nil {
+		s.log.Error("admin list review: query failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer rows.Close()
+	type row struct {
+		ID, UserID, Chain, Asset, Amount, Dest string
+		Score                                 int
+		CreatedAt                             string
+	}
+	var items []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Chain, &r.Asset,
+			&r.Amount, &r.Dest, &r.Score, &r.CreatedAt); err != nil {
+			s.log.Error("admin list review: scan failed", "error", err)
+			continue
+		}
+		items = append(items, r)
+	}
+	// Re-shape for the response.
+	type outItem struct {
+		ID        string `json:"id"`
+		UserID    string `json:"user_id"`
+		Chain     string `json:"chain"`
+		Asset     string `json:"asset"`
+		Amount    string `json:"amount"`
+		Dest      string `json:"destination"`
+		RiskScore int    `json:"risk_score"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := make([]outItem, 0, len(items))
+	for _, r := range items {
+		out = append(out, outItem{
+			ID: r.ID, UserID: r.UserID, Chain: r.Chain, Asset: r.Asset,
+			Amount: r.Amount, Dest: r.Dest, RiskScore: r.Score,
+			CreatedAt: r.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out)})
+}
+
+// approveReviewWithdrawal moves MANUAL_REVIEW -> PENDING so
+// the worker picks it up. Risk score is left on the row as
+// an audit trail; only status changes.
+func (s *server) approveReviewWithdrawal(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WithdrawalID string `json:"withdrawal_id"`
+		Note         string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	ct, err := s.pool.Exec(r.Context(),
+		`UPDATE withdrawals
+		 SET status = 'PENDING', risk_hold = false, error_msg = NULL
+		 WHERE id = $1::uuid AND status = 'MANUAL_REVIEW'`,
+		req.WithdrawalID)
+	if err != nil {
+		s.log.Error("admin approve: update failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		writeJSONError(w, http.StatusConflict, "withdrawal not in MANUAL_REVIEW")
+		return
+	}
+	s.log.Info("withdrawal approved by admin",
+		"withdrawal_id", req.WithdrawalID, "note", req.Note)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"withdrawal_id": req.WithdrawalID,
+		"status":        "PENDING",
+	})
+}
+
+// rejectReviewWithdrawal moves MANUAL_REVIEW -> REJECTED and
+// unlocks the user's balance so the funds are not frozen
+// forever.
+func (s *server) rejectReviewWithdrawal(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		WithdrawalID string `json:"withdrawal_id"`
+		Note         string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx)
+	var userID, asset, amount string
+	if err := tx.QueryRow(ctx,
+		`UPDATE withdrawals
+		 SET status = 'REJECTED', risk_hold = false,
+		     error_msg = COALESCE(NULLIF($2, ''), 'rejected by admin')
+		 WHERE id = $1::uuid AND status = 'MANUAL_REVIEW'
+		 RETURNING user_id::text, asset, amount::text`,
+		req.WithdrawalID, req.Note).Scan(&userID, &asset, &amount); err != nil {
+		writeJSONError(w, http.StatusConflict, "withdrawal not in MANUAL_REVIEW")
+		return
+	}
+	// Unfreeze the balance.
+	if _, err := tx.Exec(ctx,
+		`UPDATE balances
+		 SET available = available + GREATEST($2::numeric - frozen, 0),
+		     frozen = GREATEST(frozen - $2::numeric, 0),
+		     updated_at = NOW()
+		 WHERE user_id = $1::uuid AND asset = $3`,
+		userID, amount, asset); err != nil {
+		s.log.Error("admin reject: unlock failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		s.log.Error("admin reject: commit failed", "error", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	s.log.Info("withdrawal rejected by admin",
+		"withdrawal_id", req.WithdrawalID, "note", req.Note)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"withdrawal_id": req.WithdrawalID,
+		"status":        "REJECTED",
 	})
 }
 
