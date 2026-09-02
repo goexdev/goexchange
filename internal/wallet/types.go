@@ -10,7 +10,11 @@
 
 package wallet
 
-import "github.com/google/uuid"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // WalletType discriminates between user-facing DEPOSIT addresses,
 // the company HOT wallet (sweep destination + withdrawal source),
@@ -60,10 +64,10 @@ type Address struct {
 	Chain     string     `json:"chain"`             // "TRON" for V1
 	Asset     string     `json:"asset"`             // "USDT"
 	Type      WalletType `json:"type"`
-	Encoded   string     `json:"address"`           // TRON Base58Check / EVM 0x... / BTC bech32
-	Hex       string     `json:"address_hex"`       // hex form for indexing
-	Status    string     `json:"status"`            // "ACTIVE" | "DISABLED"
-	CreatedAt string     `json:"created_at"`
+	Encoded   string     `json:"address"`
+	Hex       string     `json:"address_hex"` // hex form for indexing
+	Status    string     `json:"status"`      // "ACTIVE" | "DISABLED"
+	CreatedAt *time.Time `json:"created_at,omitempty"`
 }
 
 // AllocateAddressRequest is the input to AllocateDepositAddress.

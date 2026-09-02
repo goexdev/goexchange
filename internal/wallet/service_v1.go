@@ -198,7 +198,7 @@ func (s *ServiceV1) persistAllocatedAddress(ctx context.Context, req AllocateAdd
 			Encoded:   encoded,
 			Hex:       hexAddr,
 			Status:    "ACTIVE",
-			CreatedAt: nowUTC(),
+			CreatedAt: timeNow(),
 		},
 		Reused:   false,
 		NewIndex: index,
@@ -270,7 +270,20 @@ func scanAddress(row interface{ Scan(...any) error }) (Address, error) {
 }
 
 // nowUTC returns the current time formatted for created_at columns.
-// Returns the RFC3339Nano string the DB expects.
+// timeNow returns a UTC *time.Time suitable for scanning into
+// the wallet_addresses.created_at timestamptz column. The
+// pointer shape matches Address.CreatedAt so callers do not
+// have to take an address. Returns nil if t is the zero time,
+// so a "freshly allocated" row can stay nil until the
+// database INSERT populates it.
+func timeNow() *time.Time {
+	now := time.Now().UTC()
+	return &now
+}
+
+// nowUTC returns the RFC3339Nano string the DB expects.
+// Kept for backwards compat with callers that still need
+// a string (e.g. literal SQL INSERTs that bypass pgx).
 func nowUTC() string {
 	return time.Now().UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
 }

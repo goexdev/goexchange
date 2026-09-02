@@ -149,6 +149,7 @@ services:
       LISTEN: ":50061"
       VAULT: "http://vault:8200"
       VAULT_TOKEN_FILE: "/run/secrets/vault_token"
+      VAULT_ROLE_ID: "${VAULT_ROLE_ID:-}"
       CHAINS: "TRON"
     volumes:
       # The vault-token file is written by deploy-fresh.sh to a host
@@ -163,7 +164,10 @@ services:
       - "50061:50061"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/50061 && exec 3<&-"]
+      # Alpine busybox sh does not support /dev/tcp. Use nc
+      # instead so the liveness probe works against the gRPC
+      # listener. nc is in the alpine base image.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
       interval: 30s
       timeout: 5s
       start_period: 10s
