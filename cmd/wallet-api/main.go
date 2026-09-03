@@ -1627,9 +1627,17 @@ func (s *server) processOneSweep(ctx context.Context, it struct {
 	}
 
 	// Note: in V1 the hot-wallet keypair is derived at index 0
-	 // by the signer service. V2 will pass an explicit
-	 // key_id per sweep (multi-hot-wallet support).
-	signedTx, _, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", "mainnet", build.RawTx)
+	// by the signer service. V2 will pass an explicit
+	// key_id per sweep (multi-hot-wallet support).
+	//
+	// The signer needs the network label so it can use the
+	// matching chain id when computing the SHA-256 digest it
+	// signs. We hand it s.networkName ("mainnet" /
+	// "nile_testnet" / "private_testnet") rather than a
+	// hardcoded string so the same code path works against any
+	// tron network — Self.7 saw NPE / SIGERROR when the signer
+	// used mainnet chain id against a private net that uses 0x27.
+	signedTx, _, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", s.networkName, build.RawTx)
 	if err != nil {
 		wlog.Error("sweep Sign RPC failed", "error", err)
 		s.failSweep(ctx, it.ID, "AWAITING_SIGN", err.Error())
@@ -1667,7 +1675,10 @@ func (s *server) processOneSweep(ctx context.Context, it struct {
 		return
 	}
 
-	bcastResp, err := s.tronAd.BroadcastWithSignature(ctx, build.RawTx, sig)
+	// POST the JSON form the chain accepts. See the equivalent
+	// block in the withdrawal worker for why raw_data_hex +
+	// signature_hex triggers NPE on TRON v4.8.2.1.
+	bcastResp, err := s.tronAd.BroadcastSigned(ctx, build.RawData, sig)
 	if err != nil {
 		wlog.Error("sweep Broadcast failed", "error", err)
 		s.failSweep(ctx, it.ID, "AWAITING_BROADCAST", err.Error())
@@ -1954,18 +1965,13 @@ func (s *server) processOneWithdrawal(ctx context.Context, it struct {
 	// 2. Build the unsigned transaction via the adapter. The
 	//    adapter talks to a chain RPC node which assembles
 	//    the protobuf and returns raw_data bytes.
-	contract := "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t" // USDT contract (mainnet; nile has its own — V1 explicit below)
-	if s.networkName == "nile_testnet" {
-		// Nile testnet USDT: TXYZop... is mainnet. The actual
-		// Nile contract address is published in the trongrid
-		// testnet docs. For V1 we accept whatever the env
-		// variable TRON_USDT_CONTRACT points to, falling back
-		// to mainnet (V1 only runs against mainnet in
-		// production; tests switch to nile separately).
-		if v := os.Getenv("TRON_USDT_CONTRACT"); v != "" {
-			contract = v
-		}
-	}
+	//
+	//    Default: native TRX (contract empty → adapter falls
+	//    back to BuildNativeTransfer). On chains that have a
+	//    TRC20 token deployed (mainnet, nile), set
+	//    TRON_USDT_CONTRACT in the environment to override;
+	//    the worker forwards that contract address verbatim.
+	contract := os.Getenv("TRON_USDT_CONTRACT")
 	hotWalletAddr := s.hotWalletAddr // populated at startup from signer DeriveAddress(0)
 	build, err := s.tronAd.BuildTransfer(ctx, hotWalletAddr, it.To, usdtToUnits(it.Amount), contract)
 	if err != nil {
@@ -1980,7 +1986,13 @@ func (s *server) processOneWithdrawal(ctx context.Context, it struct {
 	// 3. Sign via the signer service. signer returns
 	//    raw_tx || 65-byte signature; we strip the trailing
 	//    signature and use it as Transaction.signature[0].
-	signedTx, txHash, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", "mainnet", build.RawTx)
+	//
+	// Pass s.networkName so the signer picks the matching
+	// chain id (0x27 for private_testnet, 0x2b6653dc for
+	// mainnet, 0xcd8690dc for nile_testnet). Hardcoding
+	// "mainnet" here would make private_testnet withdrawals
+	// fail with SIGERROR at broadcast time.
+	signedTx, txHash, err := s.signer.Sign(ctx, "TRON", "TRON/hot/0", s.networkName, build.RawTx)
 	if err != nil {
 		wlog.Error("Sign RPC failed", "error", err)
 		s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "FAILED", nil, nil, err.Error())
@@ -2024,15 +2036,14 @@ func (s *server) processOneWithdrawal(ctx context.Context, it struct {
 		return
 	}
 
-	// 4. Broadcast. adapter.Broadcast accepts the raw signed
-// bytes (full Transaction protobuf) and returns the tx_hash
-// that the chain assigned. We pass the original build.RawTx
-// as the body and splice the signature into the protobuf in
-// the adapter — but for V1 we send raw_data + signature
-// concatenated, which is what most chainstack-compatible
-// RPCs accept directly (broadcasttransaction takes
-// "raw_data_hex" + "signature_hex" as JSON fields).
-	bcastResp, err := s.tronAd.BroadcastWithSignature(ctx, build.RawTx, sig)
+	// 4. Broadcast. We POST the JSON form the chain accepts:
+	// {raw_data: <JSON object>, signature: [hex], txID, visible:true}.
+	// The Build* path populated build.RawData with the parsed
+	// object (visible=true on the chain returns it). Posting
+	// raw_data_hex + signature_hex in a JSON envelope is what
+	// triggers the NullPointerException we hit on TRON v4.8.2.1
+	// when this method fell back to that format.
+	bcastResp, err := s.tronAd.BroadcastSigned(ctx, build.RawData, sig)
 	if err != nil {
 		wlog.Error("Broadcast failed", "error", err)
 		s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "FAILED", &txHash, nil, err.Error())
@@ -2047,18 +2058,39 @@ func (s *server) processOneWithdrawal(ctx context.Context, it struct {
 		// keep txHash from the signer — the network may not
 		// have responded with its txID but the bytes were
 		// submitted.
+		txHash = build.TxHash
 	}
 	wlog.Info("broadcast ok", "tx_hash", txHash, "accepted", bcastResp.Accepted)
 
-	// 5. BROADCASTED → COMPLETED for V1 (skip IN_BLOCK/
-	//    SOLIDIFIED tracking — confirmation watch is a
-	//    separate worker that will move it further).
-	if err := s.updateWithdrawalStatus(ctx, it.ID, "BROADCASTED", "COMPLETED", &txHash, nil, ""); err != nil {
-		wlog.Error("transition BROADCASTED->COMPLETED failed", "error", err)
+	// 5. SIGNING → BROADCASTED. Self.9 had a bug where the worker
+	//    went straight SIGNING → COMPLETED (skipping BROADCASTED
+	//    entirely), which left the row's tx_hash NULL and the
+	//    state machine stuck at SIGNING forever — the inclusion
+	//    watcher only queries `WHERE status IN ('BROADCASTED',
+	//    'IN_BLOCK')`, so it never saw the row again.
+	//
+	//    The correct flow per the confirmation-watcher's design
+	//    (see comment block above runConfirmationWatcher) is:
+	//
+	//      SIGNING  → BROADCASTED    (here: tx committed to mempool)
+	//      BROADCASTED → IN_BLOCK   (confirmation watcher, after
+	//                                gettransactioninfobyid returns
+	//                                a non-zero blockNumber)
+	//      IN_BLOCK → COMPLETED     (confirmation watcher, after
+	//                                blockNumber <= solidified head)
+	//
+	//    The worker commits to BROADCASTED, persisting tx_hash
+	//    and sent_at, then yields control to the confirmation
+	//    watcher.
+	if err := s.updateWithdrawalStatus(ctx, it.ID, "SIGNING", "BROADCASTED", &txHash, nil, ""); err != nil {
+		wlog.Error("transition SIGNING->BROADCASTED failed", "error", err)
+		return
 	}
-	// Move frozen → zero (we sent the funds; the chain owns
-	// them now). Use a separate UPDATE so we keep the audit
-	// trail clear.
+	// The frozen-balance burn (broadcast-time commitment that
+	// funds have left the ledger) belongs here, not at
+	// COMPLETED — by the time the chain confirms inclusion the
+	// frozen amount must already be zero so we never double-
+	// count or refund a tx that already moved funds.
 	if err := s.burnWithdrawalBalance(ctx, it.UID, it.Asset, it.Amount); err != nil {
 		wlog.Error("frozen->zero burn failed", "error", err)
 	}
@@ -2317,10 +2349,15 @@ func buildTronAdapter(log *slog.Logger) (*tronadapter.Adapter, error) {
 	}
 	// Network defaults to mainnet; honour TRON_NETWORK if the
 	// operator wants to point at the Nile testnet (V1 + V2 dev
-	// loop). Recognised values: "mainnet", "nile_testnet".
+	// loop) or the locally-run java-tron private net (E2E
+	// integration tests). Recognised values: "mainnet",
+	// "nile_testnet", "private_testnet".
 	network := tronadapter.NetworkMainnet
-	if v := os.Getenv("TRON_NETWORK"); v == tronadapter.NetworkNile {
+	switch os.Getenv("TRON_NETWORK") {
+	case tronadapter.NetworkNile:
 		network = tronadapter.NetworkNile
+	case tronadapter.NetworkPrivate:
+		network = tronadapter.NetworkPrivate
 	}
 	return tronadapter.NewAdapter(tronadapter.Config{
 		Providers: providers,

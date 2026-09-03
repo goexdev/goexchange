@@ -118,10 +118,17 @@ type Balance struct {
 // transaction bytes (to be signed by the signer service) and a fee
 // estimate so the caller knows whether to top up the hot wallet
 // before submitting.
+//
+// RawData carries the chain node's parsed raw_data JSON object
+// (with visible=true the node returns it directly; we keep it
+// here so the broadcast path can post the format TRON's
+// /wallet/broadcasttransaction accepts without NPE). May be nil
+// when the node only returns raw_data_hex.
 type BuildResult struct {
 	RawTx   []byte
 	TxHash  string // computed hash of the unsigned tx, useful for logging.
 	FeeCost ResourceCost
+	RawData map[string]any `json:"raw_data,omitempty"` // chain node's parsed raw_data JSON, when visible=true
 }
 
 // BroadcastResult distinguishes a successful broadcast from the

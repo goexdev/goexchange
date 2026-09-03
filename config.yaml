@@ -32,7 +32,7 @@ vault:
   # — the API picks approle when auth_method=approle). NEVER
   # commit a real secret_id here — leave it empty and let the
   # deploy script populate .env.
-  app_role_id: "520b367c-ebb5-9483-65b5-660efaa9057b"
+  app_role_id: "ab8463f8-9e2d-5f1a-1b78-44514b5016df"
   app_secret_id: ""
   # k8s_role: "goexchange"   # K8s ServiceAccount auth (for K8s deploys)
 

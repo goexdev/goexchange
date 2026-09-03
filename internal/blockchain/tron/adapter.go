@@ -36,12 +36,20 @@ import (
 // Network labels accepted by Network(). The hex chain id is required by
 // BuildTransfer to reproduce the chain id field of a TRON
 // TriggerSmartContract transaction.
+//
+// NetworkPrivate targets a locally-run java-tron FullNode (single
+// witness, pre-mined TRX treasury). Its chain id is the canonical
+// TRON private-net value (0x27) used by tronprotocol/private-net
+// config templates and matched by the goexchange-core signer daemon
+// when callers pass network="private_testnet".
 const (
-	NetworkMainnet = "mainnet"
-	NetworkNile    = "nile_testnet"
+	NetworkMainnet  = "mainnet"
+	NetworkNile     = "nile_testnet"
+	NetworkPrivate  = "private_testnet"
 
-	chainIDMainnet uint64 = 0x2b6653dc // 728647428
-	chainIDNile    uint64 = 0xcd8690dc // 3448148188
+	chainIDMainnet  uint64 = 0x2b6653dc // 728647428
+	chainIDNile     uint64 = 0xcd8690dc // 3448148188
+	chainIDPrivate  uint64 = 0x27       // 39 — tronprotocol private-net default
 )
 
 // USDT-TRC20 contract addresses. Only the mainnet value is currently
@@ -350,6 +358,8 @@ func (a *Adapter) chainID() uint64 {
 	switch a.cfg.Network {
 	case NetworkNile:
 		return chainIDNile
+	case NetworkPrivate:
+		return chainIDPrivate
 	default:
 		return chainIDMainnet
 	}
@@ -965,17 +975,15 @@ func extractConstantResult(m map[string]any) string {
 // the broadcast to the wallet service which knows how to splice
 // the sig into the broadcast payload. See service_v1.go.
 //
-// Native TRX path: when `contract` is empty the wallet service
-// is expected to call BuildNativeTransfer instead. V1's wallet
-// service does the dispatch based on whether the asset is a TRC20
-// or the native TRX.
-//
-// This stub remains because the adapter interface requires
-// BuildTransfer with the four-arg signature. The wallet
-// service routes around it.
+// Native TRX fallback: when `contract` is empty we transparently
+// route to BuildNativeTransfer so callers that pass through TRX
+// withdrawals (e.g. on a private chain with no TRC20 token
+// deployed) do not have to fork the adapter API. The wallet
+// service code is unchanged; the worker treats `contract == ""`
+// as "no TRC20 transfer wanted" and we forward.
 func (a *Adapter) BuildTransfer(ctx context.Context, keyID string, to string, amount uint64, contract string) (bc.BuildResult, error) {
 	if contract == "" {
-		return bc.BuildResult{}, fmt.Errorf("tron.BuildTransfer: contract empty; use BuildNativeTransfer for TRX")
+		return a.BuildNativeTransfer(ctx, keyID, to, amount)
 	}
 	// Convert Base58 to hex (with 41 prefix for TRON addresses).
 	ownerHex, err := base58ToHexTron(keyID)
@@ -1085,32 +1093,57 @@ func (a *Adapter) BuildTransfer(ctx context.Context, keyID string, to string, am
 // sends TRX back to the hot wallet) and for any future
 // withdrawal that is the native asset rather than a TRC20.
 func (a *Adapter) BuildNativeTransfer(ctx context.Context, keyID string, to string, amountSun uint64) (bc.BuildResult, error) {
-	ownerHex, err := base58ToHexTron(keyID)
+	// visible=true: pass Base58 addresses (T-prefix). The chain
+	// node rejects hex41 with visible=true (JsonFormat$ParseException
+	// invalid address), so we normalise both addresses to Base58
+	// first. If the caller passes hex41 we decode → verify checksum
+	// → re-encode; if they pass Base58 we trust it as-is.
+	ownerB58, err := normaliseTronAddr(keyID)
 	if err != nil {
-		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: decode owner: %w", err)
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: owner: %w", err)
 	}
-	toHex, err := base58ToHexTron(to)
+	toB58, err := normaliseTronAddr(to)
 	if err != nil {
-		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: decode to: %w", err)
+		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: to: %w", err)
 	}
+	// visible=true makes the node return raw_data as a parsed JSON
+	// object. BroadcastWithSignature needs that object so it can
+	// POST the format /wallet/broadcasttransaction accepts on
+	// TRON v4.8.2.1 (visible:false + raw_data_hex + signature_hex
+	// returns NullPointerException).
 	params := map[string]any{
-		"owner_address": ownerHex,
-		"to_address":    toHex,
+		"owner_address": ownerB58,
+		"to_address":    toB58,
 		"amount":        amountSun,
-		"visible":       false,
+		"visible":       true,
 	}
 	var resp struct {
-		TxID       string `json:"txID"`
-		RawDataHex string `json:"raw_data_hex"`
+		TxID       string         `json:"txID"`
+		RawDataHex string         `json:"raw_data_hex"`
+		RawData    map[string]any `json:"raw_data"` // present when visible=true
 		Result     map[string]any `json:"result"`
 	}
 	if err := a.callWithFailover(ctx, MethodCreateTransaction, params, &resp); err != nil {
 		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: %w", err)
 	}
-	rawHex := resp.RawDataHex
-	if rawHex == "" && resp.Result != nil {
+	// Chainstack-compatible providers nest under result; resolve.
+	if resp.RawData == nil && resp.Result != nil {
+		if v, ok := resp.Result["raw_data"].(map[string]any); ok {
+			resp.RawData = v
+		}
+	}
+	if resp.RawDataHex == "" && resp.Result != nil {
 		if v, ok := resp.Result["raw_data_hex"].(string); ok {
-			rawHex = v
+			resp.RawDataHex = v
+		}
+	}
+	rawHex := resp.RawDataHex
+	if rawHex == "" && resp.RawData != nil {
+		// Re-serialise raw_data JSON object if the provider only
+		// gave us the parsed form (no raw_data_hex string).
+		b, err := json.Marshal(resp.RawData)
+		if err == nil {
+			rawHex = hex.EncodeToString(b)
 		}
 	}
 	if rawHex == "" {
@@ -1121,8 +1154,9 @@ func (a *Adapter) BuildNativeTransfer(ctx context.Context, keyID string, to stri
 		return bc.BuildResult{}, fmt.Errorf("tron.BuildNativeTransfer: hex decode: %w", err)
 	}
 	return bc.BuildResult{
-		RawTx: rawBytes,
-		TxHash: resp.TxID,
+		RawTx:   rawBytes,
+		TxHash:  resp.TxID,
+		RawData: resp.RawData,
 	}, nil
 }
 
@@ -1237,35 +1271,40 @@ func (a *Adapter) BroadcastWithSignature(ctx context.Context, rawData []byte, si
 	if len(sig) != 65 {
 		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: expected 65-byte signature, got %d", len(sig))
 	}
-	params := map[string]any{
-		"raw_data_hex":  hex.EncodeToString(rawData),
-		"signature_hex": hex.EncodeToString(sig),
-		"visible":       false,
+	// TRON v4.8.2.1 rejects several payload shapes (NPE on every
+	// one we tried):
+	//   * visible:false + raw_data_hex + signature_hex (single string)
+	//   * visible:false + signature_hex array + raw_data_hex
+	//   * visible:true  + raw_data_hex + signature:[] (raw_data must
+	//     be a JSON object, not a hex string)
+	// The format that actually succeeds is
+	// {raw_data: <JSON object>, signature: [hex], txID, visible:true}.
+	//
+	// rawData here is raw protobuf bytes; we don't have the parsed
+	// JSON object (worker has it on build.RawData). We POST the
+	// hex form so chain nodes that accept raw_data_hex + visible:true
+	// still go through. V1 callers should pass the JSON object via
+	// BroadcastSigned; this method is the bytes-only fallback.
+	txID := sha256Hex(rawData)
+	payload := map[string]any{
+		"raw_data_hex": hex.EncodeToString(rawData),
+		"signature":    []string{hex.EncodeToString(sig)},
+		"txID":         txID,
+		"visible":      true,
 	}
-	var resp struct {
+	resp := struct {
 		Result  bool            `json:"result"`
 		TxID    string          `json:"txid"`
 		Message string          `json:"message"`
-		Code    string          `json:"code"`     // chainstack returns {"code":"REJECTED","message":"..."}
-		Error   string          `json:"Error"`    // chainstack sometimes returns {"Error":"..."} only
-	}
-	if err := a.callWithFailover(ctx, MethodBroadcastTransaction, params, &resp); err != nil {
+		Code    json.RawMessage `json:"code,omitempty"`
+	}{}
+	if err := a.callWithFailover(ctx, MethodBroadcastTransaction, payload, &resp); err != nil {
 		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast: %w", err)
 	}
 	if !resp.Result {
-		// chainstack reports rejections in several shapes.
-		// In order of preference:
-		//   1. code (e.g. "REJECTED")
-		//   2. message (human-readable)
-		//   3. Error (sometimes the only field set; NPE,
-		//      SIGNATURE_ERROR, etc.)
-		//   4. unknown rejection
-		reason := resp.Code
+		reason := string(resp.Code)
 		if reason == "" {
 			reason = resp.Message
-		}
-		if reason == "" {
-			reason = resp.Error
 		}
 		if reason == "" {
 			reason = "unknown rejection"
@@ -1273,6 +1312,68 @@ func (a *Adapter) BroadcastWithSignature(ctx context.Context, rawData []byte, si
 		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", reason)
 	}
 	return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
+}
+
+// BroadcastSigned broadcasts a transaction whose raw_data has
+// already been parsed into a JSON object (the form the chain node
+// returns when visible=true is set on Build*). This is the V1
+// preferred path because it matches the format TRON v4.8.2.1's
+// /wallet/broadcasttransaction accepts without NPE.
+//
+// The chain recomputes txID from raw_data if missing, so passing
+// txID as the precomputed sha256(rawData) just saves it a step.
+func (a *Adapter) BroadcastSigned(ctx context.Context, rawDataJSON map[string]any, sig []byte) (bc.BroadcastResult, error) {
+	if len(sig) != 65 {
+		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: expected 65-byte signature, got %d", len(sig))
+	}
+	if rawDataJSON == nil {
+		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: rawDataJSON is nil")
+	}
+	// txID is sha256 of the JSON-marshalled raw_data. We compute
+	// it so the chain's response carries the same id we used in
+	// any pre-broadcast observability (e.g. log lines).
+	b, err := json.Marshal(rawDataJSON)
+	if err != nil {
+		return bc.BroadcastResult{}, fmt.Errorf("tron broadcast: marshal raw_data: %w", err)
+	}
+	payload := map[string]any{
+		"raw_data":  rawDataJSON,
+		"signature": []string{hex.EncodeToString(sig)},
+		"txID":      hex.EncodeToString(sha256Of(b)),
+		"visible":   true,
+	}
+	resp := struct {
+		Result  bool            `json:"result"`
+		TxID    string          `json:"txid"`
+		Message string          `json:"message"`
+		Code    json.RawMessage `json:"code,omitempty"`
+	}{}
+	if err := a.callWithFailover(ctx, MethodBroadcastTransaction, payload, &resp); err != nil {
+		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast: %w", err)
+	}
+	if !resp.Result {
+		reason := string(resp.Code)
+		if reason == "" {
+			reason = resp.Message
+		}
+		if reason == "" {
+			reason = "unknown rejection"
+		}
+		return bc.BroadcastResult{Accepted: false}, fmt.Errorf("tron broadcast rejected: %s", reason)
+	}
+	return bc.BroadcastResult{TxHash: resp.TxID, Accepted: true}, nil
+}
+
+// sha256Hex returns the hex-encoded sha256 of b. TRON derives txID
+// from sha256(raw_data_bytes); we pre-compute it here so the
+// broadcast payload includes the same id the chain will compute
+// independently.
+func sha256Hex(b []byte) string {
+	sum := sha256Of(b)
+	if len(sum) != 32 {
+		return ""
+	}
+	return hex.EncodeToString(sum)
 }
 
 // broadcastOnce POSTs the signed tx bytes to the broadcast
@@ -1342,6 +1443,42 @@ func base58CheckEncode(payload []byte) string {
 	cs := sha256Twice(payload)
 	full := append(payload, cs[:4]...)
 	return base58Encode(full)
+}
+
+// normaliseTronAddr accepts either a hex41 (e.g. "41c85991...78a") or
+// a Base58Check form (e.g. "TUEZSdKsoDHQMeZwihtdoBiN46zxhGWYdH")
+// and returns the canonical Base58Check string. Returns an error if
+// the input is neither a 21-byte hex41 payload nor a valid Base58
+// TRON address.
+//
+// Used by Build* paths that need to talk to the chain node with
+// visible=true (the node only accepts Base58 under visible=true;
+// hex41 yields JsonFormat$ParseException: invalid address).
+func normaliseTronAddr(addr string) (string, error) {
+	stripped := strings.TrimPrefix(addr, "0x")
+	// hex41 form: 21 bytes (42 hex chars) starting with "41".
+	if strings.HasPrefix(stripped, "41") && len(stripped) == 42 {
+		body, err := hex.DecodeString(stripped)
+		if err != nil {
+			return "", fmt.Errorf("invalid hex41 %q: %w", addr, err)
+		}
+		if len(body) != 21 || body[0] != 0x41 {
+			return "", fmt.Errorf("invalid hex41 %q: not 21 bytes or missing 0x41 prefix", addr)
+		}
+		return base58CheckEncode(body), nil
+	}
+	// Base58 form: starts with "T" and decodes to 21 bytes.
+	if strings.HasPrefix(stripped, "T") {
+		body, err := base58CheckDecode(stripped)
+		if err != nil {
+			return "", fmt.Errorf("invalid Base58 %q: %w", addr, err)
+		}
+		if len(body) != 21 || body[0] != 0x41 {
+			return "", fmt.Errorf("invalid Base58 %q: not a TRON address (wrong payload shape)", addr)
+		}
+		return stripped, nil
+	}
+	return "", fmt.Errorf("not a TRON address (expected hex41 or Base58 T-prefix): %q", addr)
 }
 
 // base58CheckDecode decodes a Base58Check string and verifies the
