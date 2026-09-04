@@ -8,6 +8,7 @@
 #   - prometheus metrics scraper
 #   - grafana    dashboards
 #   - matching   the closed-source matching engine (private GHCR image)
+#   - mm-bot     the closed-source per-pair market-making bot
 #
 # The API and scheduler run on the host (they are public-source Go
 # binaries and are easier to iterate on without rebuilding an
@@ -132,6 +133,40 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/50051 && exec 3<&-"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # The closed-source per-pair market-making bot. Pulled from
+  # the same private GHCR image as matching but a different
+  # tag (:mmbot). The bot binary listens on :50052 and dials the
+  # matching engine over gRPC at matching:50051. It writes to the
+  # shared Postgres for mmbot_bots / mmbot_fills (migration 0035
+  # in the public API repository) and reads open orders from
+  # matching's StreamTrades feed to attribute fills.
+  #
+  # In V1 the bot is admin-controlled via POST /admin/mmbot/*
+  # against the public API on the host. There is no separate bot
+  # UI; the same admin auth gates start/stop/status.
+  mm-bot:
+    image: ghcr.io/goexdev/goexchange-core:mmbot
+    container_name: goexchange-mmbot
+    environment:
+      GRPC_ADDR: ":50052"
+      MATCHING_ADDR: "matching:50051"
+      DATABASE_URL: "postgres://exchange:***@postgres:5432/exchange?sslmode=disable"
+      log_level: "${log_level:-info}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      matching:
+        condition: service_healthy
+    ports:
+      - "50052:50052"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/50052 && exec 3<&-"]
       interval: 30s
       timeout: 5s
       start_period: 10s
