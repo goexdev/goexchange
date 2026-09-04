@@ -34,6 +34,7 @@ import (
 	"github.com/goexdev/goexchange/internal/notifier/templates"
 	"github.com/goexdev/goexchange/internal/risk"
 	"github.com/goexdev/goexchange/internal/matching"
+	"github.com/goexdev/goexchange/internal/mmbot"
 	"github.com/goexdev/goexchange/internal/trading"
 	"github.com/goexdev/goexchange/internal/user"
 	"github.com/google/uuid"
@@ -353,6 +354,14 @@ func run() error {
 
 	// Matching engine runs in matcher binary; we use a client here
 	matchingClient := matching.NewClient(cfg.Matcher.URL, log)
+
+// MMBot client (per-pair market-making bot in core).
+// Empty URL means "bot engine not deployed in this env"; the
+// client still returns a non-nil interface that always errors,
+// so admin handlers respond with HTTP 503 instead of nil-deref
+// panicking. Same pattern as the matcher client: failures are
+// surfaced to the caller, never swallowed.
+mmBotClient := mmbot.NewGRPCClient(cfg.MMBot.URL, log.With("component", "mmbot"))
 	tradingSvc := trading.NewService(pool, matching.NewOrderSourceAdapter(matchingClient), walletSvc, log)
 	marketDataSvc := marketdata.NewService(marketdata.NewMatcherAdapter(matchingClient), log)
 	// Seed the marketdata pair cache from the trading service (which
@@ -503,6 +512,7 @@ func run() error {
 		TriggerSvc:      triggerSvc,
 		AnalyticsSvc:    analyticsSvc,
 		ConfigPath:     "config.yaml",
+		MMBotClient:     mmBotClient,
 	})
 
 	srv := &http.Server{

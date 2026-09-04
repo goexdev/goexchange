@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package mmbot.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/goexdev/goexchange/internal/mmbot/mmbotv1";
+
+// MMBotService is the gRPC interface between the public API server
+// and the proprietary per-pair market-making bot. The public
+// repository owns the .proto file; the bot engine generates stubs
+// from it during build.
+//
+// One bot instance exists per configured trading pair (e.g.
+// BNB_USDT, ETH_USDT). Bots are admin-controlled: the admin
+// seeds inventory, starts/stops the run loop, and the bot quotes
+// bid/ask around the configured mid price using the existing
+// CLOB matching engine (separate gRPC service).
+service MMBotService {
+  // Start launches a new bot run for the given pair. The bot
+  // engine creates a bot_wallet (private key persisted in
+  // core, never returned in this RPC), seeds inventory from the
+  // treasury wallet, and begins quoting on the CLOB.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Stop halts a running bot: cancel all open orders, return
+  // remaining inventory to the treasury, compute P&L, and
+  // persist a final state row. Idempotent — returns the current
+  // state if the bot is already STOPPED.
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // Status returns a snapshot of one bot's current state, including
+  // inventory, outstanding orders, and realised + unrealised P&L.
+  rpc Status(StatusRequest) returns (StatusResponse);
+
+  // List returns all bots (one row per pair). Used by admin
+  // dashboards to show which pairs have an active bot.
+  rpc List(ListRequest) returns (ListResponse);
+
+  // AdminTick is a server-streaming RPC the public API uses to
+  // push operator commands (cancel all, raise spread, withdraw)
+  // into a running bot without restarting it. Currently unused;
+  // reserved for future emergency-kill features.
+  rpc AdminTick(AdminTickRequest) returns (stream AdminTickEvent);
+}
+
+// === common ===
+
+enum BotStatus {
+  BOT_STATUS_UNSPECIFIED = 0;
+  BOT_STATUS_STOPPED     = 1;
+  BOT_STATUS_SEEDING     = 2;
+  BOT_STATUS_READY       = 3;
+  BOT_STATUS_RUNNING     = 4;
+  BOT_STATUS_STOPPING    = 5;
+  BOT_STATUS_FAILED      = 6;
+}
+
+message BotState {
+  string bot_id = 1;
+  string pair = 2;
+  BotStatus status = 3;
+  string mid_price = 4;
+  int32 spread_bps = 5;
+  string base_balance = 6;
+  string quote_balance = 7;
+  repeated string open_order_ids = 8;
+  string pnl_quote = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp stopped_at = 12;
+  string last_error = 13;
+}
+
+// === Start ===
+
+message StartRequest {
+  string pair = 1;
+  string mid_price = 2;
+  string quote_seed = 3;
+  string base_seed = 4;
+  int32 spread_bps = 5;
+  string treasury_wallet = 6;
+  string min_quote_per_side = 7;
+}
+
+message StartResponse {
+  BotState bot = 1;
+}
+
+// === Stop ===
+
+message StopRequest {
+  string bot_id = 1;
+  bool return_inventory = 2;
+}
+
+message StopResponse {
+  BotState bot = 1;
+  string returned_quote = 2;
+  string returned_base = 3;
+}
+
+// === Status ===
+
+message StatusRequest {
+  string bot_id = 1;
+}
+
+message StatusResponse {
+  BotState bot = 1;
+}
+
+// === List ===
+
+message ListRequest {
+  string pair_filter = 1;
+  BotStatus status_filter = 2;
+}
+
+message ListResponse {
+  repeated BotState bots = 1;
+}
+
+// === AdminTick (reserved, currently unused) ===
+
+message AdminTickRequest {
+  string bot_id = 1;
+}
+
+message AdminTickEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ORDER_FILLED = 1;
+    KIND_INVENTORY_SKEW = 2;
+    KIND_REBALANCED   = 3;
+    KIND_HEARTBEAT    = 4;
+  }
+  Kind kind = 1;
+  google.protobuf.Timestamp at = 2;
+  string note = 3;
+}

@@ -160,12 +160,22 @@ type Config struct {
 	JWT          JWTConfig          `yaml:"jwt"`
 	ChainWatcher ChainWatcherConfig `yaml:"chainwatcher"`
 	Matcher      MatcherConfig      `yaml:"matcher"`
+	MMBot        MMBotConfig        `yaml:"mmbot"`
 	Scheduler    SchedulerConfig    `yaml:"scheduler"`
 	Notifier     NotifierConfig     `yaml:"notifier"`
 }
 
 type MatcherConfig struct {
 	URL string `yaml:"url"` // e.g. http://localhost:8098
+}
+
+// MMBotConfig configures the gRPC endpoint for the per-pair
+// market-making bot engine running in goexchange-core. The bot
+// listens on port 50052 by convention. When the URL is empty
+// (e.g. in dev without core), the client falls back to an
+// error-returning shim and admin handlers respond with 503.
+type MMBotConfig struct {
+	URL string `yaml:"url"` // e.g. localhost:50052
 }
 
 type SchedulerConfig struct {

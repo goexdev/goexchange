@@ -32,9 +32,13 @@ import (
 	"github.com/goexdev/goexchange/internal/user"
 	"github.com/goexdev/goexchange/internal/uploads"
 	"github.com/goexdev/goexchange/internal/wallet"
+	"github.com/goexdev/goexchange/internal/mmbot"
 )
 
-// Deps holds service dependencies for the router.
+// Deps holds service dependencies for the router. Exported so
+// that integration tests in internal/api package can construct
+// a minimal Deps with only the fields a specific handler
+// touches (e.g. MMBotClient for mmbot handlers).
 type Deps struct {
 	Log             *slog.Logger
 	Pool            *pgxpool.Pool
@@ -59,6 +63,13 @@ type Deps struct {
 	ChainRegistry  *chainwatcher.ChainRegistry
 	UploadStore    *uploads.Store
 	ConfigPath     string
+
+	// MMBotClient is the gRPC client for the per-pair
+	// market-making bot engine running in goexchange-core. The
+	// bot listens on port 50052 by convention. We hold the
+	// Client interface (not the concrete *grpcClientImpl) so
+	// tests can swap a fake.
+	MMBotClient     mmbot.Client
 }
 
 // NewRouter returns an http.Handler with all routes wired.
@@ -321,6 +332,17 @@ func NewRouter(d Deps) http.Handler {
 
 		r.Get("/pairs", adminListPairsHandler(d))
 		r.Post("/pairs/toggle", adminTogglePairHandler(d))
+
+		// Per-pair market-making bot (V1 MVP, BNB_USDT first).
+		// Routes route through gRPC Client -> core engine. Admin
+		// auth inherited from the /admin route group's
+		// adminMiddleware above.
+		r.Route("/mmbot", func(r chi.Router) {
+			r.Post("/start", startMMBotHandler(d))
+			r.Post("/stop", stopMMBotHandler(d))
+			r.Get("/status", mmbotStatusHandler(d))
+			r.Get("/list", mmbotListHandler(d))
+		})
 	})
 
 	r.Get("/wallets", getWalletHandler(d))

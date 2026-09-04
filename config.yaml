@@ -326,6 +326,11 @@ withdraw_fees:
 matcher:
   url: "localhost:50051"
 
+# Per-pair market-making bot engine (core). Empty url disables
+# the admin /admin/mmbot/* routes with HTTP 503.
+mmbot:
+  url: "localhost:50052"
+
 scheduler:
   url: "http://localhost:8097"
 
