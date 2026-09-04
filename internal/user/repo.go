@@ -30,6 +30,10 @@ func (r *Repo) Create(ctx context.Context, u *User) error {
 	if u.Role == "" {
 		u.Role = "user"
 	}
+	// IsBotUser is operator-controlled, never set via Create(). The
+	// only legal path to a bot account is SetBotUser(), which checks
+	// the partial unique index and refuses if one already exists.
+	u.IsBotUser = false
 	const q = `
 		INSERT INTO users (id, email, password_hash, kyc_level, kyc_status, role)
 		VALUES ($1, $2, $3, $4, $5, $6)
@@ -47,20 +51,69 @@ func (r *Repo) Create(ctx context.Context, u *User) error {
 	return nil
 }
 
+// SetBotUser marks the user with the given id as the bot account
+// and returns the refreshed User. The partial unique index on
+// users(is_bot_user) ensures at most one such row exists; a second
+// call returns ErrBotUserAlreadySet. The bot's password hash is
+// not reset; the user must already exist.
+//
+// Operators run this once per environment after migration 0036:
+//   INSERT INTO users (id, email, password_hash, kyc_status, role)
+//     VALUES ('00000000-0000-0000-0000-000000000001', 'bot@mm.example',
+//             '<random-bytes>', 'NONE', 'user')
+//   -- then call SetBotUser(ctx, parsedUUID) from a one-off main.
+//
+// Bot engine then reads MMBOT_SYSTEM_USER_ID and uses the UUID as
+// the user_id on PlaceOrder. matching's user_id validator accepts
+// any non-zero UUID.
+func (r *Repo) SetBotUser(ctx context.Context, id uuid.UUID) (*User, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE users SET is_bot_user = TRUE, updated_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			// Partial unique index violation: another row already
+			// has is_bot_user = TRUE.
+			return nil, ErrBotUserAlreadySet
+		}
+		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrUserNotFound
+	}
+	return r.FindByID(ctx, id)
+}
+
+// ClearBotUser unsets the flag. Used when decommissioning a bot
+// account or when migrating to a new one. The partial unique
+// index is unaffected -- it only constrains rows where the flag
+// is TRUE.
+func (r *Repo) ClearBotUser(ctx context.Context, id uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE users SET is_bot_user = FALSE, updated_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
 // FindByEmail retrieves a user by email.
 func (r *Repo) FindByEmail(ctx context.Context, email string) (*User, error) {
 	const q = `
 		SELECT id, email, password_hash, kyc_level, kyc_status,
 		       kyc_submitted_at, kyc_approved_at,
 		       COALESCE(kyc_rejected_reason, '') as kyc_rejected_reason,
-		       role, email_verified, created_at, updated_at
+		       role, email_verified, is_bot_user, created_at, updated_at
 		FROM users WHERE email = $1
 	`
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, email).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.KycLevel, &u.KycStatus,
 		&u.KycSubmittedAt, &u.KycApprovedAt, &u.KycRejectedReason,
-		&u.Role, &u.EmailVerified, &u.CreatedAt, &u.UpdatedAt,
+		&u.Role, &u.EmailVerified, &u.IsBotUser,
+		&u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
@@ -77,14 +130,15 @@ func (r *Repo) FindByID(ctx context.Context, id uuid.UUID) (*User, error) {
 		SELECT id, email, password_hash, kyc_level, kyc_status,
 		       kyc_submitted_at, kyc_approved_at,
 		       COALESCE(kyc_rejected_reason, '') as kyc_rejected_reason,
-		       role, email_verified, created_at, updated_at
+		       role, email_verified, is_bot_user, created_at, updated_at
 		FROM users WHERE id = $1
 	`
 	u := &User{}
 	err := r.pool.QueryRow(ctx, q, id).Scan(
 		&u.ID, &u.Email, &u.PasswordHash, &u.KycLevel, &u.KycStatus,
 		&u.KycSubmittedAt, &u.KycApprovedAt, &u.KycRejectedReason,
-		&u.Role, &u.EmailVerified, &u.CreatedAt, &u.UpdatedAt,
+		&u.Role, &u.EmailVerified, &u.IsBotUser,
+		&u.CreatedAt, &u.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound

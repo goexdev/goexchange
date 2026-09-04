@@ -93,8 +93,34 @@ func (s *Service) CountFailedLogins(ctx context.Context, email string, hours int
 	return count, err
 }
 
+// isBotUser reports whether the given user id carries the
+// is_bot_user flag. Bot accounts bypass risk scoring entirely --
+// they are owned by the market-making bot engine, which is a
+// trusted internal component. The query is a single indexed
+// lookup (PK) and returns false on any error so that a missing
+// user is treated as a normal account; the surrounding call
+// already returns its own error in that case.
+//
+// Callers should check this first and short-circuit risk scoring
+// when true. We do not propagate a query error here because the
+// risk code path treats unknowns as zero-score rather than
+// failing closed.
+func (s *Service) isBotUser(ctx context.Context, userID uuid.UUID) bool {
+	var bot bool
+	err := s.pool.QueryRow(ctx, `SELECT is_bot_user FROM users WHERE id = $1`, userID).Scan(&bot)
+	if err != nil {
+		return false
+	}
+	return bot
+}
+
 // ComputeLoginScore returns risk score for login.
 func (s *Service) ComputeLoginScore(ctx context.Context, userID uuid.UUID, email, ip string) (*Score, error) {
+	if s.isBotUser(ctx, userID) {
+		// Bot accounts are an internal component; their login
+		// activity (if any) is not a user-facing risk signal.
+		return &Score{Score: 0, Factors: map[string]int{"bot_user": 0}, Action: ActionAllow}, nil
+	}
 	factors := map[string]int{}
 
 	failed, err := s.CountFailedLogins(ctx, email, 1)
@@ -139,6 +165,13 @@ func (s *Service) ComputeLoginScore(ctx context.Context, userID uuid.UUID, email
 
 // ComputeWithdrawScore returns risk score for withdrawal.
 func (s *Service) ComputeWithdrawScore(ctx context.Context, userID uuid.UUID, amount decimal.Decimal, destAddress string) (*Score, error) {
+	if s.isBotUser(ctx, userID) {
+		// Bot accounts do not withdraw from user-facing rails;
+		// the withdrawal API itself rejects these calls earlier,
+		// so this branch is a belt-and-braces guard in case a new
+		// code path skips the API-layer check.
+		return &Score{Score: 0, Factors: map[string]int{"bot_user": 0}, Action: ActionAllow}, nil
+	}
 	factors := map[string]int{}
 
 	var email string

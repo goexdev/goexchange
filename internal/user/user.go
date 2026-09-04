@@ -21,8 +21,16 @@ type User struct {
 	KycRejectedReason string
 	Role           string // "user" or "admin"
 	EmailVerified bool   // gates login (must be true to issue JWT)
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// IsBotUser is true for accounts owned by the market-making
+	// bot engine (cmd/mmbot). The flag bypasses risk scoring,
+	// withdrawal 2FA, and trade-history audit logging so the
+	// bot's activity does not pollute normal user reporting.
+	// Operators mark this via SetBotUser(); Create() never sets it
+	// directly so a stray code path cannot elevate a regular user
+	// into the bot role.
+	IsBotUser bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Public view of a user (no password hash).
@@ -69,6 +77,12 @@ var (
 	ErrInvalidEmail      = errors.New("invalid email format")
 	ErrWeakPassword      = errors.New("password too weak (min 8 chars)")
 	ErrInvalidKYCLevel   = errors.New("invalid kyc level (must be 0, 1, or 2)")
+	// ErrBotUserAlreadySet is returned by Repo.SetBotUser when
+	// another row already carries the bot-user flag (enforced by
+	// the partial unique index idx_users_one_bot_account). The
+	// operator must ClearBotUser on the existing account before
+	// reassigning the role.
+	ErrBotUserAlreadySet = errors.New("bot user already set; clear it before reassigning")
 )
 
 

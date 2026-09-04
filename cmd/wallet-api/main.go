@@ -673,6 +673,18 @@ func (s *server) dispatchWithdrawals(w http.ResponseWriter, r *http.Request, uid
 // POST with the same key returns the original withdrawal_id and
 // does not create a new row.
 func (s *server) createWithdrawal(w http.ResponseWriter, r *http.Request, uid uuid.UUID) {
+	// Bot accounts are owned by the market-making bot engine and
+	// never initiate user-facing withdrawals -- the matching
+	// engine never raises funds this way either; bot inventory
+	// is mocked per the V1 build plan. Reject the request here
+	// so a misconfigured bot never accidentally drains its
+	// treasury balance through the user rails.
+	var isBot bool
+	if err := s.pool.QueryRow(r.Context(),
+		`SELECT is_bot_user FROM users WHERE id = $1`, uid).Scan(&isBot); err == nil && isBot {
+		writeJSONError(w, http.StatusForbidden, "bot accounts cannot initiate withdrawals")
+		return
+	}
 	var req struct {
 		Chain   string `json:"chain"`
 		Asset   string `json:"asset"`

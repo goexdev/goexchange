@@ -156,6 +156,14 @@ services:
       GRPC_ADDR: ":50052"
       MATCHING_ADDR: "matching:50051"
       DATABASE_URL: "postgres://exchange:***@postgres:5432/exchange?sslmode=disable"
+      # UUID of the bot user row. Operators must INSERT a users
+      # row, run migration 0036, then UPDATE is_bot_user = TRUE
+      # before bringing this container up. The dev default is
+      # `64bdc63f-12a5-419b-8d5f-9bfb4ed9fbd4` (alice_test); the
+      # shipped image panics on startup if MMBOT_SYSTEM_USER_ID
+      # is unset, so this compose value is the only thing keeping
+      # a fresh deploy runnable in a non-prod environment.
+      MMBOT_SYSTEM_USER_ID: "${MMBOT_SYSTEM_USER_ID:-64bdc63f-12a5-419b-8d5f-9bfb4ed9fbd4}"
       log_level: "${log_level:-info}"
     depends_on:
       postgres:

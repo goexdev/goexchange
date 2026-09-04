@@ -113,10 +113,21 @@ func placeOrderHandler(d Deps) http.HandlerFunc {
 		// NEW-M5: per-user rate limit on order placement. 20 orders/min
 		// is enough for a power-trader and stops a malicious client from
 		// loading thousands of OPEN orders into the matching engine.
-		if ok, retryAfter := orderPlaceLimiter.allow(userID); !ok {
-			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
-			writeError(w, http.StatusTooManyRequests, "order rate limit exceeded; retry shortly")
-			return
+		// Bot accounts (is_bot_user=true) bypass the limiter: the
+		// market-making engine places orders every tick and would
+		// saturate the bucket within seconds. V1 the bot talks to
+		// matching directly over gRPC so it never reaches this handler,
+		// but we leave the bypass here so the public handler cannot
+		// ever be a bottleneck for future bot operations.
+		var isBot bool
+		_ = d.Pool.QueryRow(r.Context(),
+			`SELECT is_bot_user FROM users WHERE id = $1`, uid).Scan(&isBot)
+		if !isBot {
+			if ok, retryAfter := orderPlaceLimiter.allow(userID); !ok {
+				w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+				writeError(w, http.StatusTooManyRequests, "order rate limit exceeded; retry shortly")
+				return
+			}
 		}
 
 		var in struct {
