@@ -129,12 +129,22 @@ type ChainConfig struct {
 }
 
 // TokenConfig defines an ERC20/BEP20 token on a parent chain.
+//
+// The `json:` tags mirror the YAML field names so the admin
+// web UI's ChainToken interface (lowercase `symbol`,
+// `contract`, `decimals`, etc.) sees the same shape whether
+// it parses the YAML config or the JSON HTTP response. The
+// pre-D9 response emitted Go-cased keys (`Symbol`,
+// `Contract`, ...) which the web client's lowercase type
+// silently dropped, leaving every token with `symbol ===
+// undefined` and triggering React's duplicate-key warning
+// in the chain list.
 type TokenConfig struct {
-	Symbol         string `yaml:"symbol"`
-	Contract       string `yaml:"contract"`
-	Decimals       int    `yaml:"decimals"`
-	MinConf        int    `yaml:"min_conf"`
-	VaultSecretPath string `yaml:"vault_secret_path"`
+	Symbol          string `yaml:"symbol" json:"symbol"`
+	Contract        string `yaml:"contract" json:"contract"`
+	Decimals        int    `yaml:"decimals" json:"decimals"`
+	MinConf         int    `yaml:"min_conf" json:"min_conf"`
+	VaultSecretPath string `yaml:"vault_secret_path" json:"vault_secret_path,omitempty"`
 }
 
 // VaultConfig configures HashiCorp Vault access.

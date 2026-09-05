@@ -26,11 +26,55 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/goexdev/goexchange/internal/audit"
 	"github.com/goexdev/goexchange/internal/mmbot"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// mmbotGRPCStatus maps a gRPC error returned by the mm-bot engine
+// to an HTTP status code. The mapping preserves the public
+// contract admin tooling (and the React page) relies on:
+//
+//	NotFound -> 404 (admin clicked an old link or stale bot_id)
+//	InvalidArgument -> 400 (start params out of range, etc.)
+//	FailedPrecondition -> 409 (already RUNNING, partial unique
+//	                     index conflict on pair, etc.)
+//	Unavailable / Unknown -> 503 (engine down / decode error)
+//
+// Anything else falls back to 503 with the raw error string.
+// Callers see a meaningful status code, not a generic 500.
+func mmbotGRPCStatus(err error) (int, string) {
+	if err == nil {
+		return http.StatusOK, ""
+	}
+	// The mmbot package wraps with fmt.Errorf("%w", err) so the
+	// gRPC status code is reachable via status.Code.
+	s, ok := status.FromError(err)
+	if !ok {
+		// Not a gRPC error (e.g. local validation). Fall through.
+		return http.StatusServiceUnavailable, err.Error()
+	}
+	switch s.Code() {
+	case codes.NotFound:
+		return http.StatusNotFound, s.Message()
+	case codes.InvalidArgument:
+		return http.StatusBadRequest, s.Message()
+	case codes.FailedPrecondition:
+		return http.StatusConflict, s.Message()
+	case codes.Unavailable, codes.Internal, codes.Unknown:
+		return http.StatusServiceUnavailable, s.Message()
+	default:
+		return http.StatusServiceUnavailable, s.Message()
+	}
+}
+
+// guard that keeps linter happy when this file is built without
+// the errors package being used elsewhere in the function set.
+var _ = errors.Is
 
 // startMMBotHandler: POST /admin/mmbot/start
 func startMMBotHandler(d Deps) http.HandlerFunc {
@@ -70,7 +114,7 @@ func startMMBotHandler(d Deps) http.HandlerFunc {
 				Status:      "failure",
 				ErrorMsg:    err.Error(),
 			})
-			writeError(w, http.StatusServiceUnavailable, "bot engine unavailable: "+err.Error())
+			httpStatus, httpMsg := mmbotGRPCStatus(err); writeError(w, httpStatus, httpMsg)
 			return
 		}
 		auditLogAdmin(d, r, audit.LogEntry{
@@ -120,7 +164,7 @@ func stopMMBotHandler(d Deps) http.HandlerFunc {
 				Status:      "failure",
 				ErrorMsg:    err.Error(),
 			})
-			writeError(w, http.StatusServiceUnavailable, "bot engine unavailable: "+err.Error())
+			httpStatus, httpMsg := mmbotGRPCStatus(err); writeError(w, httpStatus, httpMsg)
 			return
 		}
 		auditLogAdmin(d, r, audit.LogEntry{
@@ -155,7 +199,7 @@ func mmbotStatusHandler(d Deps) http.HandlerFunc {
 		}
 		state, err := d.MMBotClient.Status(r.Context(), botID)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "bot engine unavailable: "+err.Error())
+			httpStatus, httpMsg := mmbotGRPCStatus(err); writeError(w, httpStatus, httpMsg)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"bot": stateToJSON(state)})
@@ -176,7 +220,7 @@ func mmbotListHandler(d Deps) http.HandlerFunc {
 		}
 		states, err := d.MMBotClient.List(r.Context(), pairFilter, statusFilter)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "bot engine unavailable: "+err.Error())
+			httpStatus, httpMsg := mmbotGRPCStatus(err); writeError(w, httpStatus, httpMsg)
 			return
 		}
 		bots := make([]map[string]any, 0, len(states))
